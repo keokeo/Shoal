@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Shoal</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+      background: #1c1d22; color: #d8d8dc; font: 14px/1.6 "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+    #status { max-width: 720px; white-space: pre-wrap; text-align: center; }
+    #status.error { color: #f08a7e; text-align: left; font-family: Consolas, monospace; font-size: 12px; }
+    button { display: none; padding: 6px 18px; border: 1px solid #555; border-radius: 6px; background: #2a2b31; color: inherit; font: inherit; cursor: pointer; }
+    button:hover { background: #34353c; }
+  </style>
+</head>
+<body>
+  <div id="status">正在连接工作台服务…</div>
+  <button id="retry" onclick="location.reload()">重试</button>
+  <script>
+    // The shell calls these through eval once this page has loaded; reloading the page makes the shell try again.
+    window.setStatus = (text) => { const el = document.getElementById('status'); el.className = ''; el.textContent = text; };
+    window.setError = (text) => {
+      const el = document.getElementById('status'); el.className = 'error'; el.textContent = text;
+      document.getElementById('retry').style.display = 'block';
+    };
+  </script>
+</body>
+</html>

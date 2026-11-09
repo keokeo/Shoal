@@ -1,0 +1,51 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { availableAgents, writeHookFiles } from './agents.ts';
+import { createApp } from './http.ts';
+import { SessionManager } from './sessions.ts';
+import { createFileStore } from './store.ts';
+import { createUsage } from './usage.ts';
+
+const argIdx = process.argv.indexOf('--port');
+const port = Number(argIdx > 0 ? process.argv[argIdx + 1] : process.env.WORKBENCH_PORT ?? 47800);
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  console.error('invalid port');
+  process.exit(2);
+}
+
+// Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench (same rule in workbench.ps1).
+const defaultStateDir = () => {
+  const base = process.env.LOCALAPPDATA ?? '.';
+  const dir = path.join(base, 'Shoal'), old = path.join(base, 'agent-workbench');
+  return !fs.existsSync(dir) && fs.existsSync(old) ? old : dir;
+};
+const stateDir = path.resolve(process.env.WORKBENCH_STATE_DIR ?? defaultStateDir());
+fs.mkdirSync(stateDir, { recursive: true });
+writeHookFiles(stateDir);
+
+const token = crypto.randomBytes(24).toString('hex');
+const sessions = new SessionManager({ port, token, stateDir });
+const store = createFileStore(path.join(stateDir, 'state.json'));
+sessions.restore(store.sessions());
+const usage = createUsage({ stateDir, source: store });
+const { server } = createApp({ port, token, store, sessions, stateDir, usage, onShutdown: () => shutdown() });
+
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Shoal on http://127.0.0.1:${port}`);
+  console.log(`agents: ${availableAgents().join(', ') || '(none)'}  state: ${stateDir}`);
+  // Keeps the totals current even if nobody opens the stats tab, before the CLIs clean up old transcripts.
+  setTimeout(() => usage.scan(), 1000).unref();
+  setInterval(() => usage.scan(), 60_000).unref();
+});
+
+// A second signal exits at once, without waiting for young claude sessions (see SessionManager.killAll).
+let stopping = false;
+const shutdown = () => {
+  if (stopping) process.exit(0);
+  stopping = true;
+  server.close();
+  void sessions.killAll().then(() => process.exit(0));
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
