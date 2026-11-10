@@ -30,18 +30,20 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 - `status`：显示 PID、启动时间和在运行的会话数；未运行时退出码 3。
 - 日志：`<stateDir>\server.log`、`server.err.log`。端口被别的程序占用时会报出占用者。
 
-桌面端（Tauri 2 薄壳，`desktop/`）：在 WebView2 窗口里打开工作台，服务仍由系统 Node 运行。
+桌面端（Tauri 2 外壳，`desktop/`）：在 WebView2 窗口里打开工作台。安装包自包含：自带 Node 运行时（版本固定在 `scripts/stage-desktop.mjs`）、服务端、构建好的前端和生产依赖 `node_modules`，本机不需要 clone 仓库，也不需要 Node 或 npm；只需装好并登录要用的 CLI（Claude Code、Codex CLI、agy）。
 
 ```sh
 npm run desktop:build   # 需要 Rust；产出 desktop\src-tauri\target\release\bundle\nsis\Shoal_<版本>_x64-setup.exe
 ```
 
-也可以从 [Releases](https://github.com/qianshuixia/Shoal/releases) 下载编好的安装包。安装包只是外壳，仍需 clone 本仓库并装好 Node 24；首次启动时会让你选择 clone 下来的目录。安装包没有代码签名，SmartScreen 可能拦截（更多信息 → 仍要运行）。
+构建会先运行 `scripts/stage-desktop.mjs`：下载固定版本的 `node.exe`（校验 SHA-256），构建 `web/dist`，把所有内容放进 `desktop/bundle`（安装后位于 `resources\app`）。运行 `npm run desktop:dev` 或 `cargo check` 前需先手动跑一次。
 
-- 启动时服务没在运行就调用 `workbench.ps1 start -NoBrowser` 拉起来（失败时窗口里显示原因和「重试」），已在运行就直接连上。端口同样读 `WORKBENCH_PORT`。
+也可以从 [Releases](https://github.com/qianshuixia/Shoal/releases) 下载编好的安装包。安装包没有代码签名，SmartScreen 可能拦截（更多信息 → 仍要运行）。
+
+- 启动时服务没在运行，就在后台用自带的 `node.exe` 运行 `server/main.ts`（失败时窗口里显示原因和「重试」），已在运行就直接连上。端口同样读 `WORKBENCH_PORT`，状态目录与服务端规则相同（见下文）；继承来的 `NODE_OPTIONS`、`NODE_PATH` 会被清掉。
 - 关窗口或托盘「退出」会连服务一起停掉（不管服务是外壳还是 `start` 拉起的）；还有 agent 在跑时先弹确认，「全部退出」走和服务端 `Ctrl+C` 相同的流程，之后可在面板里续接。外壳崩溃或被强杀时服务和 agent 继续运行。托盘菜单另有显示、在浏览器中打开、重新加载。再次启动会唤出已有窗口。
 - `Ctrl+W`、`Ctrl+F`、`Ctrl+R`、`F5`、`Ctrl+P` 等交给页面和终端，不再被浏览器拦截；刷新用托盘的「重新加载」。终端里的网页链接用默认浏览器打开。
-- 外壳启动 Shoal 仓库里的 `scripts\workbench.ps1`，仓库目录按顺序查找：`WORKBENCH_ROOT`；之前选过的目录（存于 `%APPDATA%\dev.shoal.desktop\root.txt`，删掉即可重新选）；构建时所在的仓库（本机存在时）。都找不到就弹窗让你选择。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
+- 桌面端启动的会话，hook 用自带的 `node.exe` 运行，`PATH` 里没有 Node 也能用。agy 要求 hook 路径不含空格：安装路径有空格（比如用户名带空格）且该盘没有 8.3 短文件名时，agy 会被禁用。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
 
 - `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（默认 `%LOCALAPPDATA%\Shoal`；该目录不存在而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`）。
 - 服务只监听 `127.0.0.1`，校验 Host 和 Origin；hook 回调用每次启动随机生成的 token。

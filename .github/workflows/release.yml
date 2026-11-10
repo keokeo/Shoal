@@ -1,20 +1,24 @@
-# Builds the Windows desktop installer and attaches it to a draft GitHub Release.
-# Run it from the Actions tab, or push a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
-# The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it there before releasing.
+# Builds the self-contained Windows desktop installer and attaches it to a draft GitHub Release.
+# Every push to main (except docs-only changes) rebuilds the draft for the current version, replacing its installer;
+# it also runs from the Actions tab, or on a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
+# The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it there to start a new release.
 # The draft stays private until someone presses Publish on the Releases page.
 name: Release desktop
 
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**', 'e2e/**', 'LICENSE']
 
 permissions:
   contents: write
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer push to main supersedes a build still running; tag builds always finish.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 jobs:
   windows:
@@ -43,6 +47,12 @@ jobs:
         with:
           workspaces: desktop/src-tauri -> target
 
+      - name: Cache the bundled Node runtime
+        uses: actions/cache@v6
+        with:
+          path: .tmp/node-runtime
+          key: node-runtime-${{ hashFiles('scripts/stage-desktop.mjs') }}
+
       - run: npm ci
 
       - uses: tauri-apps/tauri-action@v1
@@ -56,11 +66,10 @@ jobs:
           releaseDraft: true
           uploadUpdaterJson: false
           releaseBody: |
-            Windows x64 installer for the Shoal desktop shell.
+            Windows x64 installer for the Shoal desktop app.
 
-            The installer is only the window: the server runs from a Shoal checkout on your machine's Node 24.
-            1. Install Node 24 and the CLIs you want (Claude Code, Codex CLI, agy), signed in.
-            2. `git clone https://github.com/qianshuixia/Shoal` to a path without spaces.
-            3. Run the installer and start Shoal. On first launch, pick the cloned folder; dependencies install automatically.
+            The installer is self-contained: it brings its own Node runtime, the server and the web UI, so you need no clone, Node or npm.
+            1. Install the CLIs you want (Claude Code, Codex CLI, agy) and sign in to them.
+            2. Run the installer and start Shoal.
 
             The installer is not code-signed, so Windows SmartScreen may warn: choose More info -> Run anyway.

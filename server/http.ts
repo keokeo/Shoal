@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
@@ -415,7 +416,8 @@ export function createApp(cfg: AppConfig) {
     let raw = q.get('path')?.trim();
     if (!raw) {
       const last = store.projects().reduce<Project | undefined>((a, p) => (!a || p.createdAt >= a.createdAt ? p : a), undefined);
-      raw = last ? path.dirname(last.path) : path.dirname(ROOT);
+      // The desktop app's ROOT is its install folder; start from home there, next to the checkout otherwise.
+      raw = last ? path.dirname(last.path) : process.env.WORKBENCH_BUNDLED === '1' ? os.homedir() : path.dirname(ROOT);
     }
     const abs = path.resolve(raw);
     let isDir = false;

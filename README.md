@@ -33,18 +33,20 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 - `status`: shows the PID, start time and number of running sessions; exits with code 3 when not running.
 - Logs: `<stateDir>\server.log` and `server.err.log`. If the port is taken by another program, the error names it.
 
-Desktop app (a thin Tauri 2 shell in `desktop/`): opens the workbench in a WebView2 window; the server still runs on the system Node.
+Desktop app (Tauri 2 shell in `desktop/`): opens the workbench in a WebView2 window. The installer is self-contained: it carries its own Node runtime (pinned in `scripts/stage-desktop.mjs`), the server, the built web UI and the production `node_modules`, so the machine needs no clone, Node or npm. Only the agent CLIs you want (Claude Code, Codex CLI, agy) have to be installed and signed in.
 
 ```sh
 npm run desktop:build   # needs Rust; produces desktop\src-tauri\target\release\bundle\nsis\Shoal_<version>_x64-setup.exe
 ```
 
-Prebuilt installers are on the [Releases](https://github.com/qianshuixia/Shoal/releases) page. The installer is only the shell, so you still need a clone of this repo and Node 24; on first launch it asks for the clone's folder. The installer is not code-signed, so SmartScreen may warn (More info -> Run anyway).
+The build first runs `scripts/stage-desktop.mjs`, which downloads the pinned `node.exe` (checked against its SHA-256), builds `web/dist` and stages everything in `desktop/bundle` (installed as `resources\app`). Run it once by hand before `npm run desktop:dev` or `cargo check`.
 
-- On launch, if the server is not running the shell starts it with `workbench.ps1 start -NoBrowser` (on failure the window shows the reason and a Retry button); if it is already running it connects directly. The port is also read from `WORKBENCH_PORT`.
+Prebuilt installers are on the [Releases](https://github.com/qianshuixia/Shoal/releases) page. The installer is not code-signed, so SmartScreen may warn (More info -> Run anyway).
+
+- On launch, if the server is not running the shell starts the bundled `node.exe server/main.ts` in the background (on failure the window shows the reason and a Retry button); if it is already running it connects directly. The port is also read from `WORKBENCH_PORT`, and the state directory follows the same rules as the server (below). Inherited `NODE_OPTIONS` and `NODE_PATH` are dropped.
 - Closing the window or choosing Quit in the tray stops the server too (whether the shell or `start` launched it). If agents are still running it asks first; Quit all (「全部退出」) follows the same path as `Ctrl+C` on the server, and you can resume the sessions from the panel later. If the shell crashes or is killed, the server and agents keep running. The tray menu also has Show, Open in browser and Reload. Launching again brings the existing window forward.
 - `Ctrl+W`, `Ctrl+F`, `Ctrl+R`, `F5`, `Ctrl+P` and similar keys go to the page and the terminal instead of being caught by the browser; use Reload in the tray to refresh. Web links in the terminal open in the default browser.
-- The shell starts `scripts\workbench.ps1` from a Shoal checkout, looked up in this order: `WORKBENCH_ROOT`; the folder picked earlier (saved in `%APPDATA%\dev.shoal.desktop\root.txt`; delete it to pick again); the repo it was built from, if it exists on this machine. If none is found it asks you to pick the folder. Settings stored in browser local storage, such as zoom, collapsed projects and privacy mode, are not shared with Chrome.
+- Hooks of sessions started by the desktop app run on the bundled `node.exe`, so they work without Node on `PATH`. agy needs a hook path without spaces: if the install path has one (e.g. a user name with a space) and the drive has no 8.3 short names, agy is disabled. Settings stored in browser local storage, such as zoom, collapsed projects and privacy mode, are not shared with Chrome.
 
 - `--port <n>` or `WORKBENCH_PORT` changes the port; `WORKBENCH_STATE_DIR` changes the state directory (default `%LOCALAPPDATA%\Shoal`; if that does not exist but `%LOCALAPPDATA%\agent-workbench` from before the rename does, the old one keeps being used; it holds the hook config and `events.jsonl`).
 - The server only listens on `127.0.0.1` and checks Host and Origin; hook callbacks use a token generated randomly at each start.

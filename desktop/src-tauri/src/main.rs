@@ -1,16 +1,16 @@
 // Desktop shell for Shoal: a WebView2 window on the local server, plus tray and single instance.
-// The server runs on the system Node (started through scripts/workbench.ps1 of a Shoal checkout). Quitting the
-// shell stops it along with the agents; if the shell crashes or is killed, the server and agents keep running.
+// The installer carries the whole server (resources\app: a pinned node.exe, server/, web/dist, node_modules), so it
+// needs nothing else on the machine except the agent CLIs. Quitting the shell stops the server along with the agents;
+// if the shell crashes or is killed, the server and agents keep running.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -22,13 +22,13 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const SPLASH_HOST: &str = "tauri.localhost";
-const NO_ROOT: &str = "没有选择 Shoal 仓库目录。\n\n桌面版只是外壳，服务端跑在本机 Node 24 上：先 git clone https://github.com/qianshuixia/Shoal，再点重试选择该目录（首次启动会自动 npm install）。";
 
 static CONNECTING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
-// The Shoal checkout whose scripts\workbench.ps1 runs the server; set by connect().
-static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+// PID of the server this shell started (0: none, or it was already running).
+static SERVER_PID: AtomicU32 = AtomicU32::new(0);
 
 fn port() -> u16 {
     std::env::var("WORKBENCH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47800)
@@ -38,51 +38,15 @@ fn server_url() -> Url {
     Url::parse(&format!("http://127.0.0.1:{}/", port())).expect("valid server url")
 }
 
-fn is_root(dir: &Path) -> bool {
-    dir.join("scripts").join("workbench.ps1").is_file()
-}
-
-// Where the picked checkout is remembered: %APPDATA%\dev.shoal.desktop\root.txt.
-fn root_file(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_config_dir().ok().map(|d| d.join("root.txt"))
-}
-
-// WORKBENCH_ROOT, else the checkout picked earlier, else the repo this shell was built from (a release built on
-// CI points at the CI machine, so that one only counts if it exists here). None: ask the user.
-fn find_root(app: &AppHandle) -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("WORKBENCH_ROOT") {
-        return Some(PathBuf::from(dir));
+// Same rule as server/main.ts: WORKBENCH_STATE_DIR, else %LOCALAPPDATA%\agent-workbench if an install from before the
+// rename left one, else %LOCALAPPDATA%\Shoal. The shell only needs it for the server's log files.
+fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("WORKBENCH_STATE_DIR") {
+        return PathBuf::from(dir);
     }
-    let saved = root_file(app).and_then(|f| std::fs::read_to_string(f).ok()).map(|s| PathBuf::from(s.trim()));
-    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    saved.into_iter().chain([built]).find(|d| is_root(d))
-}
-
-// Folder picker until the user picks a Shoal checkout or cancels; the choice is saved for next time.
-fn pick_root(app: &AppHandle, w: &WebviewWindow) -> Option<PathBuf> {
-    call(w, "setStatus", "请选择 Shoal 仓库目录\n（git clone 下来的目录，里面有 scripts\\workbench.ps1）");
-    loop {
-        let dir = app.dialog().file().set_title("选择 Shoal 仓库目录").set_parent(w).blocking_pick_folder()?;
-        let dir = dir.into_path().ok()?;
-        if is_root(&dir) {
-            if let Some(f) = root_file(app) {
-                let _ = f.parent().map(std::fs::create_dir_all);
-                let _ = std::fs::write(&f, dir.to_string_lossy().as_bytes());
-            }
-            return Some(dir);
-        }
-        let again = app
-            .dialog()
-            .message(format!("{} 里没有 scripts\\workbench.ps1，不是 Shoal 仓库。", dir.display()))
-            .title("选择 Shoal 仓库目录")
-            .kind(MessageDialogKind::Warning)
-            .parent(w)
-            .buttons(MessageDialogButtons::OkCancelCustom("重新选择".into(), "取消".into()))
-            .blocking_show();
-        if !again {
-            return None;
-        }
-    }
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let old = base.join("agent-workbench");
+    if old.is_dir() { old } else { base.join("Shoal") }
 }
 
 // Minimal HTTP/1.0 client for the local server: 1.0 keeps Node from chunking the body. No Origin header, so the
@@ -119,38 +83,63 @@ fn live_sessions(port: u16) -> Option<usize> {
     Some(sessions.iter().filter(|s| s.get("status").and_then(|v| v.as_str()) != Some("exited")).count())
 }
 
-// workbench.ps1 owns npm install, rebuilding web/dist, port-conflict checks and the detached hidden server.
-fn run_script(port: u16, args: &str) -> Result<(), String> {
-    let root = ROOT.lock().unwrap().clone().ok_or("还没有选择 Shoal 仓库目录")?;
-    let script = root.join("scripts").join("workbench.ps1");
-    let script = script.canonicalize().map_err(|e| format!("找不到启动脚本 {}：{e}", script.display()))?;
-    let script = script.to_string_lossy().trim_start_matches(r"\\?\").to_string();
-    let cmd = format!(
-        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; & '{}' {args} -Port {port}; exit $LASTEXITCODE",
-        script.replace('\'', "''")
-    );
-    // Output goes to a file, not a pipe: the server started by Start-Process inherits these handles,
-    // and a pipe would then never reach EOF while the server runs.
-    let log_path = std::env::temp_dir().join("shoal-shell-start.log");
-    let log = File::create(&log_path).map_err(|e| format!("无法创建 {}：{e}", log_path.display()))?;
-    let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(log_err)
-        .status()
-        .map_err(|e| format!("无法运行 powershell.exe：{e}"))?;
-    if status.success() {
-        return Ok(());
-    }
-    let text = std::fs::read(&log_path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-    Err(format!("workbench.ps1 {args} 失败（退出码 {:?}）\n\n{}", status.code(), text.trim()))
+fn port_taken(port: u16) -> bool {
+    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
-// Same path as Ctrl+C on the server: it waits for freshly started claude sessions before killing them.
-// Servers from before /api/shutdown existed answer 404; those get stopped by workbench.ps1 instead.
+fn tail(path: &PathBuf, lines: usize) -> String {
+    let text = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let all: Vec<&str> = text.trim_end().lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+// Starts resources\app\server\main.ts on the bundled node.exe, detached from the shell: own process group and a
+// hidden console, so agents keep running if the shell dies. Waits until the server answers.
+fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
+    if port_taken(port) {
+        return Err(format!("端口 {port} 被其他程序占用。\n可以用环境变量 WORKBENCH_PORT 换一个端口后再启动 Shoal。"));
+    }
+    let res = app.path().resource_dir().map_err(|e| format!("找不到安装目录：{e}"))?;
+    let dir = PathBuf::from(res.to_string_lossy().trim_start_matches(r"\\?\")).join("app");
+    let node = dir.join("node.exe");
+    if !node.is_file() {
+        return Err(format!("安装不完整，缺少 {}。\n请重新安装 Shoal。", node.display()));
+    }
+    let state = state_dir();
+    std::fs::create_dir_all(&state).map_err(|e| format!("无法创建 {}：{e}", state.display()))?;
+    let (out_path, err_path) = (state.join("server.log"), state.join("server.err.log"));
+    let out = File::create(&out_path).map_err(|e| format!("无法写入 {}：{e}", out_path.display()))?;
+    let err = File::create(&err_path).map_err(|e| format!("无法写入 {}：{e}", err_path.display()))?;
+    let mut child = Command::new(&node)
+        .args(["server/main.ts", "--port", &port.to_string()])
+        .current_dir(&dir)
+        // Only the bundled runtime decides how the server runs: no inherited Node flags, preloads or module paths.
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .env("WORKBENCH_BUNDLED", "1")
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .map_err(|e| format!("无法启动 {}：{e}", node.display()))?;
+    SERVER_PID.store(child.id(), Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !server_ready(port) {
+        if let Ok(Some(status)) = child.try_wait() {
+            SERVER_PID.store(0, Ordering::SeqCst);
+            return Err(format!("服务启动失败（{status}），日志：{}\n\n{}", err_path.display(), tail(&err_path, 20)));
+        }
+        if Instant::now() > deadline {
+            return Err(format!("30 秒内服务没有就绪，日志：{}", out_path.display()));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Ok(())
+}
+
+// Same path as Ctrl+C on the server: it waits for freshly started claude sessions before killing them. If it does
+// not stop in time and this shell started it, end its process tree.
 fn stop_server(port: u16) {
     if matches!(request(port, "POST", "/api/shutdown"), Some((202, _))) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -161,7 +150,16 @@ fn stop_server(port: u16) {
             return;
         }
     }
-    let _ = run_script(port, "stop -Force");
+    let pid = SERVER_PID.load(Ordering::SeqCst);
+    if pid != 0 {
+        let _ = Command::new("taskkill.exe")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 // Window close and the tray's 退出 both end here: confirm if agents are running, stop the server, exit.
@@ -194,12 +192,6 @@ fn quit(app: &AppHandle) {
             let _ = w.hide();
         }
         if live.is_some() {
-            // Connected to a server that was already running: find the checkout for stop_server's fallback.
-            let mut root = ROOT.lock().unwrap();
-            if root.is_none() {
-                *root = find_root(&app);
-            }
-            drop(root);
             stop_server(port);
         }
         app.exit(0);
@@ -220,26 +212,8 @@ fn connect(w: WebviewWindow) {
         let result = if server_ready(port) {
             Ok(())
         } else {
-            let app = w.app_handle().clone();
-            let root = ROOT.lock().unwrap().clone().or_else(|| find_root(&app)).or_else(|| pick_root(&app, &w));
-            *ROOT.lock().unwrap() = root.clone();
-            match root {
-                None => Err(NO_ROOT.to_string()),
-                Some(_) => {
-                    call(&w, "setStatus", "正在启动工作台服务…\n前端有更新时会先构建，可能要几十秒");
-                    run_script(port, "start -NoBrowser")
-                }
-            }
-            .and_then(|()| {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !server_ready(port) {
-                    if Instant::now() > deadline {
-                        return Err(format!("服务已启动，但 127.0.0.1:{port} 没有响应"));
-                    }
-                    std::thread::sleep(Duration::from_millis(300));
-                }
-                Ok(())
-            })
+            call(&w, "setStatus", "正在启动工作台服务…");
+            start_server(w.app_handle(), port)
         };
         match result {
             Ok(()) => {

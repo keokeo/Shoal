@@ -1,11 +1,27 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import type { AgentKind } from '../shared/protocol.ts';
 
+// Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
+// 8.3 short form when the volume has one.
+function shortPath(p: string): string {
+  if (!p.includes(' ') || process.platform !== 'win32') return p;
+  try {
+    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true }).trim();
+    return out && fs.existsSync(out) ? out : p;
+  } catch {
+    return p;
+  }
+}
+
 export const ROOT = path.resolve(import.meta.dirname, '..');
-export const NOTIFY = path.join(ROOT, 'hooks', 'notify.mjs').replaceAll('\\', '/');
+export const NOTIFY = shortPath(path.join(ROOT, 'hooks', 'notify.mjs')).replaceAll('\\', '/');
+// The desktop app's hooks run on its bundled Node: the user's machine may have none on PATH. A checkout keeps `node`.
+export const NODE = process.env.WORKBENCH_BUNDLED === '1' ? shortPath(process.execPath).replaceAll('\\', '/') : 'node';
+const nodeCmd = NODE.includes(' ') ? `"${NODE}"` : NODE;
 const FAKE_AGENT = path.join(ROOT, 'test', 'fixtures', 'fake-agent.mjs');
 
 const appdata = () => process.env.APPDATA ?? '';
@@ -18,9 +34,9 @@ const CLAUDE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure'
 const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionRequest'];
 const AGY_EVENTS = ['SessionStart', 'PreInvocation', 'PostInvocation', 'Stop'];
 
-const hookCmd = (agent: string, ev: string) => `node "${NOTIFY}" ${agent} ${ev}`;
+const hookCmd = (agent: string, ev: string) => `${nodeCmd} "${NOTIFY}" ${agent} ${ev}`;
 // agy runs hook commands through `cmd /c`, which breaks quoted paths.
-const agyUsable = () => !NOTIFY.includes(' ');
+const agyUsable = () => !NOTIFY.includes(' ') && !NODE.includes(' ');
 
 // Claude saves a conversation as <config>/projects/<cwd slug>/<uuid>.jsonl once a prompt is sent; read-only check.
 export function claudeConversationExists(id: string): boolean {
@@ -62,11 +78,11 @@ export function writeHookFiles(stateDir: string): void {
   fs.writeFileSync(path.join(stateDir, 'claude-hooks.json'), JSON.stringify({ hooks }, null, 2));
 
   if (!agyUsable()) {
-    console.warn(`[agents] WARNING: hook script path contains a space (${NOTIFY}); agy hooks cannot be quoted, agy is disabled`);
+    console.warn(`[agents] WARNING: hook command path contains a space (${NODE} ${NOTIFY}); agy hooks cannot be quoted, agy is disabled`);
     return;
   }
   const agy: Record<string, unknown> = {};
-  for (const ev of AGY_EVENTS) agy[ev] = [{ type: 'command', command: `node ${NOTIFY} agy ${ev}`, timeout: 5 }];
+  for (const ev of AGY_EVENTS) agy[ev] = [{ type: 'command', command: `${NODE} ${NOTIFY} agy ${ev}`, timeout: 5 }];
   const dir = path.join(stateDir, 'agy-hooks', '.agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ workbench: agy }, null, 2));

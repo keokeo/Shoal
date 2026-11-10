@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NOTIFY } from './agents.ts';
+import { buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY } from './agents.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -13,7 +13,7 @@ const build = (agent: 'claude' | 'codex' | 'agy' | 'fake', prompt: string, sessi
 describe('buildLaunch', () => {
   it('codex hook args are byte-identical to the M0 probe format and never bypass trust', () => {
     const { args } = build('codex', 'do it');
-    const hookToml = (ev: string) => `hooks.${ev}=[{hooks=[{type="command",command='node "${NOTIFY}" codex ${ev}',timeout=5}]}]`;
+    const hookToml = (ev: string) => `hooks.${ev}=[{hooks=[{type="command",command='${NODE} "${NOTIFY}" codex ${ev}',timeout=5}]}]`;
     expect(args.slice(1)).toEqual([
       '-c', hookToml('SessionStart'),
       '-c', hookToml('UserPromptSubmit'),
