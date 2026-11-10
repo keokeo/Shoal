@@ -3,6 +3,7 @@
 # it also runs from the Actions tab, or on a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
 # The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it there to start a new release.
 # The draft stays private until someone presses Publish on the Releases page.
+# Once a version is published its installer is never replaced: builds for that version stop early until the version is bumped.
 name: Release desktop
 
 on:
@@ -36,26 +37,48 @@ jobs:
             throw "Tag ${{ github.ref_name }} does not match tauri.conf.json version v$version"
           }
 
+      - name: Skip versions that are already published
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $draft = gh release view "v$version" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0 -and $draft -eq 'false') {
+            "::notice::v$version is already published; bump version in desktop/src-tauri/tauri.conf.json to build a new release."
+            "published=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "published=false" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+
       - uses: actions/setup-node@v7
+        if: steps.release.outputs.published != 'true'
         with:
           node-version: 24
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.release.outputs.published != 'true'
 
       - uses: swatinem/rust-cache@v2
+        if: steps.release.outputs.published != 'true'
         with:
           workspaces: desktop/src-tauri -> target
 
       - name: Cache the bundled Node runtime
+        if: steps.release.outputs.published != 'true'
         uses: actions/cache@v6
         with:
           path: .tmp/node-runtime
           key: node-runtime-${{ hashFiles('scripts/stage-desktop.mjs') }}
 
       - run: npm ci
+        if: steps.release.outputs.published != 'true'
 
       - uses: tauri-apps/tauri-action@v1
+        if: steps.release.outputs.published != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -66,10 +89,16 @@ jobs:
           releaseDraft: true
           uploadUpdaterJson: false
           releaseBody: |
-            Windows x64 installer for the Shoal desktop app.
+            Windows x64 installer for the Shoal desktop app, a local workbench that runs Claude Code, Codex CLI and Antigravity CLI (`agy`) sessions side by side.
 
-            The installer is self-contained: it brings its own Node runtime, the server and the web UI, so you need no clone, Node or npm.
-            1. Install the CLIs you want (Claude Code, Codex CLI, agy) and sign in to them.
-            2. Run the installer and start Shoal.
+            The installer is self-contained. It brings its own Node runtime, the Shoal server and the web UI, so running Shoal needs no clone of this repo and no pre-installed Node or npm. The agent CLIs are separate: you install them yourself.
 
-            The installer is not code-signed, so Windows SmartScreen may warn: choose More info -> Run anyway.
+            Before you start:
+            1. Install the agent CLIs you want and sign in to them. Shoal looks for Claude Code and Codex CLI installed globally with npm (`npm install -g @anthropic-ai/claude-code`, `npm install -g @openai/codex`; these two need Node.js and npm on your system) and for agy in its default location (`%LOCALAPPDATA%\agy\bin\agy.exe`).
+            2. Run the installer and start Shoal from the Start menu.
+
+            Notes:
+            - The installer is not code-signed, so Windows SmartScreen may warn: choose More info -> Run anyway.
+            - Shoal listens only on `127.0.0.1:47800`. Its state (the project list, tasks, sessions) and server logs are kept in `%LOCALAPPDATA%\Shoal`; your code stays in your own folders.
+            - Closing the window or choosing Quit in the tray asks for confirmation if agents are running, then stops the server and its agent sessions; you can resume them from the panel later.
+            - Shoal is an independent open-source project and is not affiliated with or endorsed by Anthropic, OpenAI or Google.
