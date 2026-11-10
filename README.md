@@ -39,10 +39,12 @@ Desktop app (a thin Tauri 2 shell in `desktop/`): opens the workbench in a WebVi
 npm run desktop:build   # needs Rust; produces desktop\src-tauri\target\release\bundle\nsis\Shoal_<version>_x64-setup.exe
 ```
 
+Prebuilt installers are on the [Releases](https://github.com/qianshuixia/Shoal/releases) page. The installer is only the shell, so you still need a clone of this repo and Node 24; on first launch it asks for the clone's folder. The installer is not code-signed, so SmartScreen may warn (More info -> Run anyway).
+
 - On launch, if the server is not running the shell starts it with `workbench.ps1 start -NoBrowser` (on failure the window shows the reason and a Retry button); if it is already running it connects directly. The port is also read from `WORKBENCH_PORT`.
 - Closing the window or choosing Quit in the tray stops the server too (whether the shell or `start` launched it). If agents are still running it asks first; Quit all (「全部退出」) follows the same path as `Ctrl+C` on the server, and you can resume the sessions from the panel later. If the shell crashes or is killed, the server and agents keep running. The tray menu also has Show, Open in browser and Reload. Launching again brings the existing window forward.
 - `Ctrl+W`, `Ctrl+F`, `Ctrl+R`, `F5`, `Ctrl+P` and similar keys go to the page and the terminal instead of being caught by the browser; use Reload in the tray to refresh. Web links in the terminal open in the default browser.
-- The shell starts the `scripts\workbench.ps1` of the repo it was built from (written in at compile time; override with `WORKBENCH_ROOT`). Settings stored in browser local storage, such as zoom, collapsed projects and privacy mode, are not shared with Chrome.
+- The shell starts `scripts\workbench.ps1` from a Shoal checkout, looked up in this order: `WORKBENCH_ROOT`; the folder picked earlier (saved in `%APPDATA%\dev.shoal.desktop\root.txt`; delete it to pick again); the repo it was built from, if it exists on this machine. If none is found it asks you to pick the folder. Settings stored in browser local storage, such as zoom, collapsed projects and privacy mode, are not shared with Chrome.
 
 - `--port <n>` or `WORKBENCH_PORT` changes the port; `WORKBENCH_STATE_DIR` changes the state directory (default `%LOCALAPPDATA%\Shoal`; if that does not exist but `%LOCALAPPDATA%\agent-workbench` from before the rename does, the old one keeps being used; it holds the hook config and `events.jsonl`).
 - The server only listens on `127.0.0.1` and checks Host and Origin; hook callbacks use a token generated randomly at each start.

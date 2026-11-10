@@ -36,10 +36,12 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 npm run desktop:build   # 需要 Rust；产出 desktop\src-tauri\target\release\bundle\nsis\Shoal_<版本>_x64-setup.exe
 ```
 
+也可以从 [Releases](https://github.com/qianshuixia/Shoal/releases) 下载编好的安装包。安装包只是外壳，仍需 clone 本仓库并装好 Node 24；首次启动时会让你选择 clone 下来的目录。安装包没有代码签名，SmartScreen 可能拦截（更多信息 → 仍要运行）。
+
 - 启动时服务没在运行就调用 `workbench.ps1 start -NoBrowser` 拉起来（失败时窗口里显示原因和「重试」），已在运行就直接连上。端口同样读 `WORKBENCH_PORT`。
 - 关窗口或托盘「退出」会连服务一起停掉（不管服务是外壳还是 `start` 拉起的）；还有 agent 在跑时先弹确认，「全部退出」走和服务端 `Ctrl+C` 相同的流程，之后可在面板里续接。外壳崩溃或被强杀时服务和 agent 继续运行。托盘菜单另有显示、在浏览器中打开、重新加载。再次启动会唤出已有窗口。
 - `Ctrl+W`、`Ctrl+F`、`Ctrl+R`、`F5`、`Ctrl+P` 等交给页面和终端，不再被浏览器拦截；刷新用托盘的「重新加载」。终端里的网页链接用默认浏览器打开。
-- 外壳从哪个仓库构建，就启动哪个仓库的 `scripts\workbench.ps1`（编译时写入；可用 `WORKBENCH_ROOT` 覆盖）。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
+- 外壳启动 Shoal 仓库里的 `scripts\workbench.ps1`，仓库目录按顺序查找：`WORKBENCH_ROOT`；之前选过的目录（存于 `%APPDATA%\dev.shoal.desktop\root.txt`，删掉即可重新选）；构建时所在的仓库（本机存在时）。都找不到就弹窗让你选择。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
 
 - `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（默认 `%LOCALAPPDATA%\Shoal`；该目录不存在而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`）。
 - 服务只监听 `127.0.0.1`，校验 Host 和 Origin；hook 回调用每次启动随机生成的 token。

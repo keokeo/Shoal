@@ -1,15 +1,16 @@
 // Desktop shell for Shoal: a WebView2 window on the local server, plus tray and single instance.
-// The server runs on the system Node (started through scripts/workbench.ps1). Quitting the shell stops it
-// along with the agents; if the shell crashes or is killed, the server and agents keep running.
+// The server runs on the system Node (started through scripts/workbench.ps1 of a Shoal checkout). Quitting the
+// shell stops it along with the agents; if the shell crashes or is killed, the server and agents keep running.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -22,9 +23,12 @@ use tauri_plugin_window_state::StateFlags;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SPLASH_HOST: &str = "tauri.localhost";
+const NO_ROOT: &str = "没有选择 Shoal 仓库目录。\n\n桌面版只是外壳，服务端跑在本机 Node 24 上：先 git clone https://github.com/qianshuixia/Shoal，再点重试选择该目录（首次启动会自动 npm install）。";
 
 static CONNECTING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
+// The Shoal checkout whose scripts\workbench.ps1 runs the server; set by connect().
+static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn port() -> u16 {
     std::env::var("WORKBENCH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47800)
@@ -34,11 +38,51 @@ fn server_url() -> Url {
     Url::parse(&format!("http://127.0.0.1:{}/", port())).expect("valid server url")
 }
 
-// The repo this shell was built from; WORKBENCH_ROOT overrides it.
-fn root() -> PathBuf {
-    std::env::var_os("WORKBENCH_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(".."))
+fn is_root(dir: &Path) -> bool {
+    dir.join("scripts").join("workbench.ps1").is_file()
+}
+
+// Where the picked checkout is remembered: %APPDATA%\dev.shoal.desktop\root.txt.
+fn root_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("root.txt"))
+}
+
+// WORKBENCH_ROOT, else the checkout picked earlier, else the repo this shell was built from (a release built on
+// CI points at the CI machine, so that one only counts if it exists here). None: ask the user.
+fn find_root(app: &AppHandle) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("WORKBENCH_ROOT") {
+        return Some(PathBuf::from(dir));
+    }
+    let saved = root_file(app).and_then(|f| std::fs::read_to_string(f).ok()).map(|s| PathBuf::from(s.trim()));
+    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    saved.into_iter().chain([built]).find(|d| is_root(d))
+}
+
+// Folder picker until the user picks a Shoal checkout or cancels; the choice is saved for next time.
+fn pick_root(app: &AppHandle, w: &WebviewWindow) -> Option<PathBuf> {
+    call(w, "setStatus", "请选择 Shoal 仓库目录\n（git clone 下来的目录，里面有 scripts\\workbench.ps1）");
+    loop {
+        let dir = app.dialog().file().set_title("选择 Shoal 仓库目录").set_parent(w).blocking_pick_folder()?;
+        let dir = dir.into_path().ok()?;
+        if is_root(&dir) {
+            if let Some(f) = root_file(app) {
+                let _ = f.parent().map(std::fs::create_dir_all);
+                let _ = std::fs::write(&f, dir.to_string_lossy().as_bytes());
+            }
+            return Some(dir);
+        }
+        let again = app
+            .dialog()
+            .message(format!("{} 里没有 scripts\\workbench.ps1，不是 Shoal 仓库。", dir.display()))
+            .title("选择 Shoal 仓库目录")
+            .kind(MessageDialogKind::Warning)
+            .parent(w)
+            .buttons(MessageDialogButtons::OkCancelCustom("重新选择".into(), "取消".into()))
+            .blocking_show();
+        if !again {
+            return None;
+        }
+    }
 }
 
 // Minimal HTTP/1.0 client for the local server: 1.0 keeps Node from chunking the body. No Origin header, so the
@@ -77,7 +121,8 @@ fn live_sessions(port: u16) -> Option<usize> {
 
 // workbench.ps1 owns npm install, rebuilding web/dist, port-conflict checks and the detached hidden server.
 fn run_script(port: u16, args: &str) -> Result<(), String> {
-    let script = root().join("scripts").join("workbench.ps1");
+    let root = ROOT.lock().unwrap().clone().ok_or("还没有选择 Shoal 仓库目录")?;
+    let script = root.join("scripts").join("workbench.ps1");
     let script = script.canonicalize().map_err(|e| format!("找不到启动脚本 {}：{e}", script.display()))?;
     let script = script.to_string_lossy().trim_start_matches(r"\\?\").to_string();
     let cmd = format!(
@@ -149,6 +194,12 @@ fn quit(app: &AppHandle) {
             let _ = w.hide();
         }
         if live.is_some() {
+            // Connected to a server that was already running: find the checkout for stop_server's fallback.
+            let mut root = ROOT.lock().unwrap();
+            if root.is_none() {
+                *root = find_root(&app);
+            }
+            drop(root);
             stop_server(port);
         }
         app.exit(0);
@@ -169,8 +220,17 @@ fn connect(w: WebviewWindow) {
         let result = if server_ready(port) {
             Ok(())
         } else {
-            call(&w, "setStatus", "正在启动工作台服务…\n前端有更新时会先构建，可能要几十秒");
-            run_script(port, "start -NoBrowser").and_then(|()| {
+            let app = w.app_handle().clone();
+            let root = ROOT.lock().unwrap().clone().or_else(|| find_root(&app)).or_else(|| pick_root(&app, &w));
+            *ROOT.lock().unwrap() = root.clone();
+            match root {
+                None => Err(NO_ROOT.to_string()),
+                Some(_) => {
+                    call(&w, "setStatus", "正在启动工作台服务…\n前端有更新时会先构建，可能要几十秒");
+                    run_script(port, "start -NoBrowser")
+                }
+            }
+            .and_then(|()| {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !server_ready(port) {
                     if Instant::now() > deadline {
