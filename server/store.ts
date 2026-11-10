@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import type { Card, Project, SessionInfo, Task } from '../shared/protocol.ts';
 import { CARDS_PER_TASK, TASK_COLORS } from '../shared/protocol.ts';
+import { cleanTitle } from './titles.ts';
 
 // Pre-muted palette; tasks stored with these are migrated to the TASK_COLORS entry at the same index.
 export const LEGACY_TASK_COLORS = [
@@ -105,12 +106,26 @@ export function createFileStore(file: string): Store {
     }
   }
   let migrated = false;
+  const oldTitles = new Map<Task, string>(); // titles rewritten by cleanTitle
   if (init) {
     for (const t of init.tasks) {
       if (t.phase !== 'active' && t.phase !== 'review' && t.phase !== 'approved' && t.phase !== 'archived') { t.phase = 'active'; t.phaseSince = t.createdAt; migrated = true; }
       if (typeof t.titleAuto !== 'boolean') { t.titleAuto = false; migrated = true; }
       const i = typeof t.color === 'string' ? (LEGACY_TASK_COLORS as readonly string[]).indexOf(t.color.toLowerCase()) : -1;
       if (i >= 0) { t.color = TASK_COLORS[i]; migrated = true; }
+      const title = typeof t.title === 'string' ? cleanTitle(t.title) : t.title;
+      if (title !== t.title) { oldTitles.set(t, t.title); t.title = title; }
+    }
+    // Titles are user data: rewrite them only once the file as it was is kept aside.
+    if (oldTitles.size) {
+      const keep = `${file}.before-title-cleanup`;
+      try {
+        if (!fs.existsSync(keep)) fs.copyFileSync(file, keep);
+        migrated = true;
+      } catch (e) {
+        console.error(`[store] 无法备份 ${file}，跳过标题清理：`, (e as Error).message);
+        for (const [t, title] of oldTitles) t.title = title;
+      }
     }
     // Their processes died with the previous server.
     init.sessions = init.sessions.map(({ queued: _q, ...s }) => s.status === 'exited'

@@ -1,5 +1,7 @@
 # Shoal v1 需求与方案
 
+[English](v1-spec.en.md) | 简体中文
+
 > 项目原名 Agent Workbench，本文是开发时的设计记录，文中的“虾哥”指作者。
 
 状态：草案；M0 技术验证已通过（2026-11-08，报告见 `.tmp/m0/REPORT.md`）；M1 已通过（2026-11-08，见 `.tmp/m1/RUN.md`）；M2 已通过（2026-11-09，见 `.tmp/m2/RUN.md`）

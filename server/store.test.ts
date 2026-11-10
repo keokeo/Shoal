@@ -74,6 +74,21 @@ describe('file store', () => {
       .toEqual([['#8baeda', false], ['#123456', false], ['#adaf78', false]]);
   });
 
+  it('cleans placeholder titles on load, keeping the original file aside', () => {
+    const before = JSON.stringify({ version: 1, projects: [], sessions: [], tasks: [
+      { ...task('t1'), title: '[Image #1] 偶现 战斗开…' },
+      { ...task('t2'), title: '手动起的名字' },
+      { ...task('t3'), title: 'C:\\Users\\Administrat…' },
+    ] });
+    fs.writeFileSync(file, before);
+    const s = createFileStore(file);
+    expect(s.tasks().map(t => t.title)).toEqual(['偶现 战斗开…', '手动起的名字', 'C:\\Users\\Administrat…']);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).tasks[0].title).toBe('偶现 战斗开…');
+    expect(fs.readFileSync(file + '.before-title-cleanup', 'utf8')).toBe(before);
+    createFileStore(file); // nothing left to clean: no second backup, no rewrite needed
+    expect(fs.readFileSync(file + '.before-title-cleanup', 'utf8')).toBe(before);
+  });
+
   it('keeps the newest CARDS_PER_TASK cards per task, persists them, and drops them with the task', () => {
     const a = createFileStore(file);
     a.addTask(task('t1'));

@@ -118,7 +118,8 @@ test.describe('待验收闭环', () => {
     await taskRow(page, task.id).hover();
     await taskRow(page, task.id).getByTestId('task-remove').click();
     await expect(taskRow(page, task.id)).toHaveCount(0);
-    const toggle = group.getByTestId('archived-toggle');
+    await expect(group.getByTestId('archived-toggle')).toHaveCount(0);
+    const toggle = page.getByTestId('archived-toggle');
     await expect(toggle).toHaveText(/已归档\s*1/);
     await expect.poll(async () => (await state(request)).sessions.find((s) => s.id === s2)?.status).toBe('exited');
     expect((await taskOf(request, task.id)).phase).toBe('archived');

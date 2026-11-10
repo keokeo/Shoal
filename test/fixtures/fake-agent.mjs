@@ -22,11 +22,18 @@ let transcript = transcriptFor(nativeId);
 fs.mkdirSync(path.dirname(transcript), { recursive: true });
 const record = (role, text) => fs.appendFileSync(transcript, JSON.stringify({ role, text }) + '\n');
 
+// One hook at a time, in order, like the real CLIs (they wait for each hook). Fired concurrently, a PermissionRequest
+// could reach the server before the UserPromptSubmit sent just before it, leaving the session stuck in working.
+let hooks = Promise.resolve();
 function hook(event, extra = {}) {
-  const p = spawn(process.execPath, [NOTIFY, 'fake', event], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
-  p.on('error', () => {});
-  p.stdin.on('error', () => {});
-  p.stdin.end(JSON.stringify({ session_id: nativeId, transcript_path: transcript, ...extra }));
+  const body = JSON.stringify({ session_id: nativeId, transcript_path: transcript, ...extra });
+  hooks = hooks.then(() => new Promise((done) => {
+    const p = spawn(process.execPath, [NOTIFY, 'fake', event], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
+    p.on('error', done);
+    p.on('exit', done);
+    p.stdin.on('error', () => {});
+    p.stdin.end(body);
+  }));
 }
 
 let line = '';
@@ -109,7 +116,7 @@ function submit() {
     out('\r\nflooded\r\n> ');
   } else if (cmd === 'exit') {
     out('bye\r\n');
-    process.exit(Number(arg) || 0);
+    process.exit(Number(arg) || 0); // like a crash: hooks still queued are lost
   } else if (cmd === 'ask') {
     hook('PermissionRequest', { tool_name: 'Fake' });
     out('Allow? (y/n)');

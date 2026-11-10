@@ -29,6 +29,7 @@ const upsert = <T extends { id: string }>(list: T[], item: T): T[] =>
   list.some((x) => x.id === item.id) ? list.map((x) => (x.id === item.id ? item : x)) : [...list, item];
 
 const COLLAPSED_KEY = 'wb.collapsed';
+const ARCHIVE_OPEN_KEY = 'wb.archiveOpen';
 function loadCollapsed(): Set<string> {
   try {
     const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? '[]');
@@ -63,6 +64,17 @@ const SCALE_STEP = 5;
 function loadScale(): number {
   const v = Number(localStorage.getItem(SCALE_KEY));
   return Number.isFinite(v) && v >= SCALE_MIN && v <= SCALE_MAX ? Math.round(v / 5) * 5 : 100;
+}
+
+// Sidebar width in rem (so it follows the zoom), dragged on its right edge; double-click resets.
+const SIDE_KEY = 'wb.sideWidth';
+const SIDE_DEFAULT = 17;
+const SIDE_MIN = 13;
+const SIDE_MAX = 32;
+const clampSide = (v: number) => Math.min(SIDE_MAX, Math.max(SIDE_MIN, Math.round(v * 4) / 4));
+function loadSide(): number {
+  const v = Number(localStorage.getItem(SIDE_KEY));
+  return Number.isFinite(v) && v > 0 ? clampSide(v) : SIDE_DEFAULT;
 }
 
 // Sessions that want the user, oldest first: asked a question (需要你, task still active) / finished a task (待验收).
@@ -106,6 +118,8 @@ export function App() {
   const zoomBy = (dir: 1 | -1) => setScale((v) => Math.min(SCALE_MAX, Math.max(SCALE_MIN, v + dir * SCALE_STEP)));
   const privacy = usePrivacy();
   const [order, setOrder] = useState(loadOrder);
+  const [sideW, setSideW] = useState(loadSide);
+  const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
 
   // Latest state for handlers registered once (WebSocket, window listeners).
   const live = useRef({ data, panes, focusedPane, layout, dialog });
@@ -118,6 +132,14 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed]));
   }, [collapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(SIDE_KEY, String(sideW));
+  }, [sideW]);
+
+  useEffect(() => {
+    localStorage.setItem(ARCHIVE_OPEN_KEY, archiveOpen ? '1' : '0');
+  }, [archiveOpen]);
 
   useLayoutEffect(() => {
     document.documentElement.style.fontSize = `${(16 * scale) / 100}px`;
@@ -495,7 +517,7 @@ export function App() {
   const forwardSource = forwardCard ? tasksById.get(forwardCard.taskId) : undefined;
 
   return (
-    <div className={`app ${privacy ? 'privacy' : ''}`}>
+    <div className={`app ${privacy ? 'privacy' : ''}`} style={{ '--side-w': `${sideW}rem` } as CSSProperties}>
       {!connected && <div className="banner" data-testid="conn-banner">连接断开，正在重连…</div>}
       {connected && notice && <div className="banner" data-testid="notice" onClick={() => setNotice('')}>{notice}</div>}
       <header className="topbar">
@@ -512,7 +534,7 @@ export function App() {
           className={`needs ${needsYou.length ? 'on' : ''}`}
           data-testid="needs-you"
           disabled={!needsYou.length}
-          title="跳到等你最久的会话（Alt+`）"
+          title="跳到等你最久的会话。Alt+` 在“需要你”和“待验收”里依次跳"
           onClick={jumpNeeds}
         >
           <span className="needs-dot" />需要你 <span data-testid="needs-you-count">{needsYou.length}</span>
@@ -521,14 +543,12 @@ export function App() {
           className={`needs review ${reviewing.length ? 'on' : ''}`}
           data-testid="review-queue"
           disabled={!reviewing.length}
-          title="跳到等你验收最久的任务"
+          title="跳到等你验收最久的任务。Alt+` 在“需要你”和“待验收”里依次跳"
           onClick={jumpReview}
         >
           <span className="needs-dot" />待验收 <span data-testid="review-count">{reviewing.length}</span>
         </button>
         <div className="top-right">
-          <span className="keys"><kbd>Alt</kbd><kbd>`</kbd> 下一个等你的</span>
-          <span className="keys"><kbd>Alt</kbd><kbd>N</kbd> 在当前项目新建任务</span>
           {/* Stepper, not a slider: the slider's rem width changed under the cursor while dragging. */}
           <div className="zoom" title="界面缩放：点 −/+ 或在这里滚动滚轮，每次 5%；点数字恢复 100%" onWheel={(e) => e.deltaY && zoomBy(e.deltaY < 0 ? 1 : -1)}>
             <span className="muted">缩放</span>
@@ -549,10 +569,35 @@ export function App() {
         </div>
       </header>
       <aside className="sidebar" hidden={view !== 'work'}>
+        <div
+          className="side-resizer"
+          data-testid="side-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-valuenow={sideW}
+          title="拖动调整侧边栏宽度，双击恢复默认"
+          onDoubleClick={() => setSideW(SIDE_DEFAULT)}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const el = e.currentTarget;
+            el.setPointerCapture(e.pointerId);
+            const left = el.parentElement!.getBoundingClientRect().left;
+            const remPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+            const move = (ev: PointerEvent) => setSideW(clampSide((ev.clientX - left) / remPx));
+            const up = () => {
+              el.removeEventListener('pointermove', move);
+              el.removeEventListener('pointerup', up);
+              el.removeEventListener('pointercancel', up);
+            };
+            el.addEventListener('pointermove', move);
+            el.addEventListener('pointerup', up);
+            el.addEventListener('pointercancel', up);
+          }}
+        />
         <div className="side-head">
           <span className="side-title">项目</span>
           <button className="ghost" data-testid="new-project-btn" onClick={() => setDialog('project')}>新建项目</button>
-          <button className="ghost" data-testid="new-task-btn" disabled={!data.projects.length} onClick={() => setDialog('task')}>新建任务</button>
+          <button className="ghost" data-testid="new-task-btn" title="新建任务（Alt+N：在当前项目用上次的 agent 直接新建）" disabled={!data.projects.length} onClick={() => setDialog('task')}>新建任务</button>
         </div>
         <div className="side-list">
           {!data.projects.length && (
@@ -564,7 +609,7 @@ export function App() {
             <ProjectGroup
               key={project.id}
               project={project}
-              tasks={data.tasks.filter((t) => t.projectId === project.id).sort((a, b) => a.createdAt - b.createdAt)}
+              tasks={data.tasks.filter((t) => t.projectId === project.id && t.phase !== 'archived').sort((a, b) => a.createdAt - b.createdAt)}
               sessionsById={sessionsById}
               visibleIds={visibleIds}
               focusedId={focusedSessionId}
@@ -580,9 +625,22 @@ export function App() {
               onRemoveProject={() => void removeProject(project)}
               onRename={renameTask}
               onResume={(task) => void resumeTask(task)}
-              onUnarchive={(task) => void setPhase(task, 'unarchive')}
             />
           ))}
+          <ArchiveSection
+            projects={sortedProjects}
+            tasks={data.tasks.filter((t) => t.phase === 'archived')}
+            sessionsById={sessionsById}
+            visibleIds={visibleIds}
+            focusedId={focusedSessionId}
+            now={now}
+            open={archiveOpen}
+            onToggle={() => setArchiveOpen((v) => !v)}
+            onOpen={(id) => showSession(id)}
+            onRemove={removeTask}
+            onRename={renameTask}
+            onUnarchive={(task) => void setPhase(task, 'unarchive')}
+          />
         </div>
       </aside>
       <main className={`main layout-${layout}`} hidden={view !== 'work'}>
@@ -672,7 +730,7 @@ export function App() {
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, collapsed, agents, defaultAgent, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume, onUnarchive }: {
+function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, collapsed, agents, defaultAgent, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -690,16 +748,16 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   onRemoveProject(): void;
   onRename(task: Task, title: string): void;
   onResume(task: Task): void;
-  onUnarchive(task: Task): void;
 }) {
   const privacy = usePrivacy();
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<'before' | 'after' | null>(null); // insertion line while another project is dragged over
   const [menu, setMenu] = useState(false);
-  const [showArchived, setShowArchived] = useState(false);
-  const archived = tasks.filter((t) => t.phase === 'archived');
-  tasks = tasks.filter((t) => t.phase !== 'archived');
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
+  // Running tasks first, then approved (done, session still open), stopped last; creation order within each.
+  // Status changes inside a band (working / needs you / review) never move a row under the cursor.
+  const band = (t: Task) => ((t.sessionId && sessionsById.get(t.sessionId)?.status) ?? 'exited') === 'exited' ? 2 : t.phase === 'approved' ? 1 : 0;
+  tasks = [...tasks].sort((a, b) => band(a) - band(b));
   const row = (task: Task) => (
     <TaskRow
       key={task.id}
@@ -714,7 +772,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
       onRemove={() => onRemove(task)}
       onRename={(title) => onRename(task, title)}
       onResume={() => onResume(task)}
-      onUnarchive={() => onUnarchive(task)}
+      onUnarchive={() => {}}
     />
   );
   return (
@@ -752,7 +810,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
           <span className="group-name" data-private="">{project.name}</span>
           {collapsed && waiting > 0
             ? <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>
-            : <span className="group-count">{tasks.length || ''}</span>}
+            : collapsed && <span className="group-count">{tasks.length || ''}</span>}
         </button>
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
@@ -761,7 +819,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
           <button
             className="icon-btn"
             data-testid="project-add-task"
-            title={privacy ? undefined : `在「${project.name}」新建任务`}
+            title={privacy ? undefined : `在「${project.name}」新建任务（Alt+N 在当前项目新建）`}
             aria-haspopup="menu"
             aria-expanded={menu}
             onClick={() => setMenu((m) => !m)}
@@ -782,13 +840,60 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
         </div>
       </div>
       {!collapsed && tasks.map(row)}
-      {!collapsed && !tasks.length && !archived.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
-      {!collapsed && archived.length > 0 && (
-        <button className="archived-toggle" data-testid="archived-toggle" aria-expanded={showArchived} onClick={() => setShowArchived((v) => !v)}>
-          已归档 {archived.length}
-        </button>
-      )}
-      {!collapsed && showArchived && archived.map(row)}
+      {!collapsed && !tasks.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
+    </section>
+  );
+}
+
+// All archived tasks in one folded section at the bottom of the sidebar, grouped by project in sidebar order.
+function ArchiveSection({ projects, tasks, sessionsById, visibleIds, focusedId, now, open, onToggle, onOpen, onRemove, onRename, onUnarchive }: {
+  projects: Project[];
+  tasks: Task[];
+  sessionsById: Map<string, SessionInfo>;
+  visibleIds: (string | null)[];
+  focusedId: string | null;
+  now: number;
+  open: boolean;
+  onToggle(): void;
+  onOpen(sessionId: string): void;
+  onRemove(task: Task): void;
+  onRename(task: Task, title: string): void;
+  onUnarchive(task: Task): void;
+}) {
+  if (!tasks.length) return null;
+  return (
+    <section className="archive" data-testid="archive-section">
+      <button className="archived-toggle" data-testid="archived-toggle" aria-expanded={open} onClick={onToggle}>
+        <svg className="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
+        <span>已归档</span>
+        <span className="group-count">{tasks.length}</span>
+      </button>
+      {open && projects.map((project) => {
+        const mine = tasks.filter((t) => t.projectId === project.id).sort((a, b) => b.phaseSince - a.phaseSince);
+        if (!mine.length) return null;
+        return (
+          <div key={project.id} className="archive-group" data-project-id={project.id}>
+            <div className="archive-project" data-private="">{project.name}</div>
+            {mine.map((task) => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                session={task.sessionId ? sessionsById.get(task.sessionId) : undefined}
+                inPane={!!task.sessionId && visibleIds.includes(task.sessionId)}
+                paneFocused={!!task.sessionId && task.sessionId === focusedId}
+                paneMark={task.sessionId && visibleIds.length === 2 ? (['左', '右'] as const)[visibleIds.indexOf(task.sessionId)] : undefined}
+                draggable={visibleIds.length === 2}
+                now={now}
+                onOpen={onOpen}
+                onRemove={() => onRemove(task)}
+                onRename={(title) => onRename(task, title)}
+                onResume={() => {}}
+                onUnarchive={() => onUnarchive(task)}
+              />
+            ))}
+          </div>
+        );
+      })}
     </section>
   );
 }
