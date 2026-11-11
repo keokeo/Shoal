@@ -31,7 +31,7 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 - `start`: runs `npm install` if `node_modules` is missing, rebuilds the frontend if its sources are newer than `web/dist`, then starts the server in the background in a separate hidden console and opens the browser once it is ready (`-NoBrowser` skips that). If the server is already running it only reports that and does not restart. Closing the window you started it from does not affect the server.
 - `stop`: ends the server together with the agent processes it started. If agent sessions are still running it asks first (`-Force` skips the prompt); you can resume them from the panel later.
 - `status`: shows the PID, start time and number of running sessions; exits with code 3 when not running.
-- Logs: `<stateDir>\server.log` and `server.err.log`. If the port is taken by another program, the error names it.
+- Logs: `<stateDir>\server.log` and `server.err.log`; the previous run's are kept as `server.prev.log` and `server.err.prev.log`, so the reason for a crash survives a restart. If the port is taken by another program, the error names it.
 
 Desktop app (Tauri 2 shell in `desktop/`): opens the workbench in a WebView2 window. The installer is self-contained: it carries its own Node runtime (pinned in `scripts/stage-desktop.mjs`), the server, the built web UI and the production `node_modules`, so the machine needs no clone, Node or npm. Only the agent CLIs you want (Claude Code, Codex CLI, agy) have to be installed and signed in.
 
@@ -51,10 +51,12 @@ Prebuilt installers are on the [Releases](https://github.com/qianshuixia/Shoal/r
 - `Ctrl+W`, `Ctrl+F`, `Ctrl+R`, `F5`, `Ctrl+P` and similar keys go to the page and the terminal instead of being caught by the browser; use Reload in the tray to refresh. Web links in the terminal open in the default browser.
 - Hooks of sessions started by the desktop app run on the bundled `node.exe`, so they work without Node on `PATH`. agy needs a hook path without spaces: if the install path has one (e.g. a user name with a space) and the drive has no 8.3 short names, agy is disabled. Settings stored in browser local storage, such as zoom, collapsed projects and privacy mode, are not shared with Chrome.
 
-- `--port <n>` or `WORKBENCH_PORT` changes the port; `WORKBENCH_STATE_DIR` changes the state directory (default `%LOCALAPPDATA%\Shoal`; if that does not exist but `%LOCALAPPDATA%\agent-workbench` from before the rename does, the old one keeps being used; it holds the hook config and `events.jsonl`).
+- `--port <n>` or `WORKBENCH_PORT` changes the port; `WORKBENCH_STATE_DIR` changes the state directory (default `%LOCALAPPDATA%\Shoal`; while that has no `state.json` but `%LOCALAPPDATA%\agent-workbench` from before the rename exists, the old one keeps being used; it holds the hook config and `events.jsonl`, which moves to `events.1.jsonl` once it passes 10 MB).
 - The server only listens on `127.0.0.1` and checks Host and Origin; hook callbacks use a token generated randomly at each start.
 - Frontend development: run the server with `npm start` (not `node --watch`, since a restart kills every running agent); with `WORKBENCH_DEV=1`, `npm run dev:web` (Vite, port 5173) is allowed.
 - Project, task and session metadata is written to `<stateDir>/state.json`; after a server restart old tasks show as Exited and are not resumed automatically (to avoid burning quota all at once). A corrupt file is renamed to `state.json.corrupt-<timestamp>` and the server starts from an empty state.
+
+Every push to `main`, including documentation changes, queues a Windows desktop release. CI advances the patch version past the source version and existing release tags, writes it to `tauri.conf.json`, `Cargo.toml` and `Cargo.lock`, and commits it back to `main`. It then builds the installer and publishes the Release from that commit. The automatic version commit does not trigger another build.
 
 ## Usage
 

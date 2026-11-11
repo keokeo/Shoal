@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { pipeline } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
@@ -105,6 +106,9 @@ export function createApp(cfg: AppConfig) {
     projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
   });
 
+  const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
+    !!saved && JSON.stringify({ ...saved, cols: next.cols, rows: next.rows }) === JSON.stringify(next);
+
   const clients = new Set<WebSocket>();
   const broadcast = (m: ServerMsg) => {
     const raw = JSON.stringify(m);
@@ -112,7 +116,8 @@ export function createApp(cfg: AppConfig) {
   };
   sessions.subscribe(m => {
     if (m.t === 'session') {
-      store.saveSession(m.session);
+      // A terminal resize changes only cols/rows: not worth rewriting state.json for (the next real change saves them too).
+      if (!sizeOnly(store.getSession(m.session.id), m.session)) store.saveSession(m.session);
       broadcast(m);
       // Typing a follow-up in the terminal takes the task out of 待验收 / 已通过 / 已归档.
       const task = m.session.status === 'working' ? store.getTask(m.session.taskId) : undefined;
@@ -612,7 +617,8 @@ export function createApp(cfg: AppConfig) {
     if (!inside || !fs.existsSync(file) || !fs.statSync(file).isFile()) file = path.join(DIST, 'index.html'); // SPA fallback
     res.writeHead(200, { 'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream' });
     if (req.method === 'HEAD') res.end();
-    else fs.createReadStream(file).pipe(res);
+    // pipeline: a read error (file replaced by a rebuild mid-request) ends this response instead of crashing the server.
+    else pipeline(fs.createReadStream(file), res, e => { if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[static]', file, e.message); });
   }
 
   // DNS rebinding: a foreign page re-pointed at 127.0.0.1 sends same-origin GETs without Origin, but its Host is foreign.

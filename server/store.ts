@@ -18,6 +18,7 @@ export interface Store {
   setSettings(s: Settings): void;
   getProject(id: string): Project | undefined;
   getTask(id: string): Task | undefined;
+  getSession(id: string): SessionInfo | undefined;
   addProject(p: Project): void;
   addTask(t: Task): void;
   updateTask(t: Task): void;
@@ -53,6 +54,7 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
     cards: () => [...cards.values()],
     getProject: id => projects.get(id),
     getTask: id => tasks.get(id),
+    getSession: id => sessions.get(id),
     addProject: p => { projects.set(p.id, p); onChange(store); },
     addTask: t => { tasks.set(t.id, t); onChange(store); },
     updateTask: t => { tasks.set(t.id, t); onChange(store); },

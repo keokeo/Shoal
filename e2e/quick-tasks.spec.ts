@@ -44,7 +44,85 @@ test.afterEach(() => expect(realAgentPosts).toEqual([]));
 const group = (page: Page, projectId: string) => page.locator(`[data-testid="project-group"][data-project-id="${projectId}"]`);
 const rowTitle = (page: Page, sessionId: string) => row(page, sessionId).getByTestId('task-title-text');
 
-async function quickFake(page: Page, projectId: string) {
+test('快捷新建和 Alt+N：窗格切换时焦点同步就位，双屏输入不串到旧会话', async ({ page }, testInfo) => {
+  const project = await createProject(page.request, token('quick-focus'));
+  const original = await createFakeTask(page.request, project.id, '原会话');
+  await page.goto('/');
+  await expect(pane(page, 0)).toHaveAttribute('data-session-id', original.session.id);
+  await expect(pane(page, 0).locator('.xterm-helper-textarea')).toBeFocused();
+
+  // Observe at the end of the DOM commit, before the next browser task can send input.
+  // A visible new session must already own focus, including when its HTTP response arrives late.
+  await page.evaluate(() => {
+    (window as any).__focusMoves = [];
+    new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.type !== 'attributes' || r.attributeName !== 'data-session-id') continue;
+        if (!(r.target instanceof HTMLElement) || !r.target.matches('[data-testid="pane"]')) continue;
+        const shown = (r.target as HTMLElement).dataset.sessionId;
+        if (!shown) continue;
+        const active = document.activeElement;
+        const focused = active?.classList.contains('xterm-helper-textarea')
+          ? active.closest<HTMLElement>('[data-testid="pane"]')?.dataset.sessionId : null;
+        (window as any).__focusMoves.push({ shown, focused });
+      }
+    }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['data-session-id'] });
+  });
+
+  try {
+    // The server broadcasts creation before the POST response is consumed by App.
+    // Hold that response until the test has observed the new task on the server.
+    let releaseResponse!: () => void;
+    const held = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    await page.route('**/api/tasks', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      expect(route.request().postDataJSON().agent).toBe('fake');
+      const response = await route.fetch();
+      await held;
+      await route.fulfill({ response });
+    });
+    let created: Awaited<ReturnType<typeof state>>['tasks'][number] | undefined;
+    try {
+      created = await quickFake(page, project.id, false);
+      await expect(pane(page, 0)).toHaveAttribute('data-session-id', original.session.id);
+    } finally {
+      releaseResponse();
+    }
+    const id = created!.sessionId!;
+    await expect(pane(page, 0)).toHaveAttribute('data-session-id', id);
+    await expect(pane(page, 0).locator('.xterm-helper-textarea')).toBeFocused();
+    await page.keyboard.type('new left\r');
+    await expect.poll(() => fakeLines(id)).toEqual(['new left']);
+
+    await page.getByText('双屏', { exact: true }).click();
+    await pane(page, 1).click();
+    await row(page, original.session.id).click();
+    await expect(pane(page, 1)).toHaveAttribute('data-session-id', original.session.id);
+    await expect(pane(page, 1).locator('.xterm-helper-textarea')).toBeFocused();
+    await page.keyboard.press('Alt+KeyN');
+    let next: typeof created;
+    await expect.poll(async () => {
+      next = (await state(page.request)).tasks.find((t) => t.id !== created!.id && t.id !== original.task.id);
+      return next?.sessionId ?? null;
+    }).not.toBeNull();
+    const rightId = next!.sessionId!;
+    await expect(pane(page, 1)).toHaveAttribute('data-session-id', rightId);
+    await expect(pane(page, 1).locator('.xterm-helper-textarea')).toBeFocused();
+    await page.keyboard.type('new right\r');
+    await expect.poll(() => fakeLines(rightId)).toEqual(['new right']);
+    expect(fakeLines(id)).toEqual(['new left']);
+    expect(fakeLines(original.session.id)).toEqual([]);
+    const moves = await page.evaluate(() => (window as any).__focusMoves as { shown: string; focused: string | null }[]);
+    expect(moves.map((m) => m.shown)).toEqual([id, original.session.id, rightId]);
+    expect(moves.every((m) => m.shown === m.focused), JSON.stringify(moves)).toBe(true);
+  } finally {
+    const evidence = testInfo.outputPath('focus-moves.json');
+    fs.writeFileSync(evidence, JSON.stringify(await page.evaluate(() => (window as any).__focusMoves), null, 2));
+    await testInfo.attach('focus-moves', { path: evidence, contentType: 'application/json' });
+  }
+});
+
+async function quickFake(page: Page, projectId: string, waitForFocus = true) {
   const before = new Set((await state(page.request)).tasks.map((t) => t.id));
   await group(page, projectId).getByTestId('project-add-task').click();
   await page.locator('[data-testid="quick-agent"][data-agent="fake"]').click();
@@ -54,6 +132,11 @@ async function quickFake(page: Page, projectId: string) {
     created = (await state(page.request)).tasks.find((t) => !before.has(t.id));
     return created?.sessionId ?? null;
   }).not.toBeNull();
+  if (waitForFocus) {
+    const shown = page.locator(`[data-testid="pane"][data-session-id="${created!.sessionId}"]`);
+    await expect(shown).toBeVisible();
+    await expect(shown.locator('.xterm-helper-textarea')).toBeFocused();
+  }
   return created!;
 }
 

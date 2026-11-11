@@ -1,7 +1,7 @@
 # Builds the self-contained Windows desktop installer and publishes it as a GitHub Release.
-# Every push to main (except docs-only changes) builds the current version and publishes it right away;
+# Every push to main bumps the patch version, builds the installer and publishes it right away;
 # it also runs from the Actions tab, or on a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
-# The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it (build-desktop.cmd does) to release again.
+# CI writes the version back to main with GITHUB_TOKEN, which does not trigger another push workflow.
 # Once a version is published its installer is never replaced: builds for that version stop early until the version is bumped.
 name: Release desktop
 
@@ -10,15 +10,15 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths-ignore: ['**.md', 'docs/**', 'e2e/**', 'LICENSE']
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
-  # A newer push to main supersedes a build still running; tag builds always finish.
-  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+  group: release-desktop
+  # Preserve each queued push and serialize version allocation, including tag/manual runs.
+  queue: max
+  cancel-in-progress: false
 
 jobs:
   windows:
@@ -26,6 +26,54 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check release version logic
+        run: node --test scripts/bump-release-version.test.mjs
+
+      - name: Advance the desktop version on main
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            git fetch origin main --tags
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch release history' }
+            # A queued run starts from the latest main, including any earlier version commit.
+            git checkout --detach origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot check out main' }
+            node scripts/bump-release-version.mjs
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot advance desktop version' }
+            $version = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+            git add desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot stage version files' }
+            git commit -m "chore(release): v$version"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot commit desktop version' }
+            # Reserve the tag with the version commit so a later build cannot attach to another commit.
+            git tag "v$version"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot reserve release tag' }
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/v$version"
+            if ($LASTEXITCODE -eq 0) { break }
+            git tag -d "v$version"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot clean up the local release tag' }
+            if ($attempt -eq 3) { throw 'Cannot save desktop version after 3 attempts' }
+            # A main/tag push won the race: fetch and allocate again, without force pushing.
+          }
+
+      - name: Record the exact build commit
+        id: version
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read build commit' }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
 
       - name: Tag matches the app version
         if: startsWith(github.ref, 'refs/tags/')
@@ -51,12 +99,6 @@ jobs:
             "published=false" >> $env:GITHUB_OUTPUT
           }
           exit 0
-
-      - uses: actions/setup-node@v7
-        if: steps.release.outputs.published != 'true'
-        with:
-          node-version: 24
-          cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.release.outputs.published != 'true'
@@ -85,6 +127,7 @@ jobs:
           tauriScript: npx tauri
           tagName: v__VERSION__
           releaseName: Shoal v__VERSION__
+          releaseCommitish: ${{ steps.version.outputs.commit }}
           releaseDraft: false
           uploadUpdaterJson: false
           releaseBody: |
@@ -98,6 +141,6 @@ jobs:
 
             Notes:
             - The installer is not code-signed, so Windows SmartScreen may warn: choose More info -> Run anyway.
-            - Shoal listens only on `127.0.0.1:47800`. Its state (the project list, tasks, sessions) and server logs are kept in `%LOCALAPPDATA%\Shoal`; your code stays in your own folders.
+            - Shoal listens only on 127.0.0.1:47800. State and server logs are stored under LOCALAPPDATA: Shoal by default, or agent-workbench for older installs until Shoal has its own state.json. Your code stays in your own folders.
             - Closing the window or choosing Quit in the tray asks for confirmation if agents are running, then stops the server and its agent sessions; you can resume them from the panel later.
             - Shoal is an independent open-source project and is not affiliated with or endorsed by Anthropic, OpenAI or Google.

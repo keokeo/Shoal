@@ -28,7 +28,7 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 - `start`：缺 `node_modules` 时先 `npm install`，前端源码比 `web/dist` 新时先构建，然后在独立的隐藏控制台后台启动服务，就绪后打开浏览器（`-NoBrowser` 不打开）。已在运行时只报告，不重启。关掉启动用的窗口不影响服务。
 - `stop`：连同服务启动的 agent 进程一起结束。还有 agent 会话在运行时先确认（`-Force` 跳过），之后可在面板里续接。
 - `status`：显示 PID、启动时间和在运行的会话数；未运行时退出码 3。
-- 日志：`<stateDir>\server.log`、`server.err.log`。端口被别的程序占用时会报出占用者。
+- 日志：`<stateDir>\server.log`、`server.err.log`；上一次运行的日志保留为 `server.prev.log`、`server.err.prev.log`，崩溃原因不会随重启丢失。端口被别的程序占用时会报出占用者。
 
 桌面端（Tauri 2 外壳，`desktop/`）：在 WebView2 窗口里打开工作台。安装包自包含：自带 Node 运行时（版本固定在 `scripts/stage-desktop.mjs`）、服务端、构建好的前端和生产依赖 `node_modules`，本机不需要 clone 仓库，也不需要 Node 或 npm；只需装好并登录要用的 CLI（Claude Code、Codex CLI、agy）。
 
@@ -48,10 +48,12 @@ build-desktop.cmd       # 同样的构建，先升版本号：默认 patch，也
 - `Ctrl+W`、`Ctrl+F`、`Ctrl+R`、`F5`、`Ctrl+P` 等交给页面和终端，不再被浏览器拦截；刷新用托盘的「重新加载」。终端里的网页链接用默认浏览器打开。
 - 桌面端启动的会话，hook 用自带的 `node.exe` 运行，`PATH` 里没有 Node 也能用。agy 要求 hook 路径不含空格：安装路径有空格（比如用户名带空格）且该盘没有 8.3 短文件名时，agy 会被禁用。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
 
-- `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（默认 `%LOCALAPPDATA%\Shoal`；该目录不存在而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`）。
+- `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（默认 `%LOCALAPPDATA%\Shoal`；该目录里还没有 `state.json` 而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`，后者超过 10 MB 时移为 `events.1.jsonl`）。
 - 服务只监听 `127.0.0.1`，校验 Host 和 Origin；hook 回调用每次启动随机生成的 token。
 - 开发前端：用 `npm start` 跑服务端（不要用 `node --watch`，重启会杀掉所有在跑的 agent），`WORKBENCH_DEV=1` 时允许 `npm run dev:web`（Vite，5173 端口）。
 - 项目、任务和会话元数据写入 `<stateDir>/state.json`；服务重启后旧任务显示「已退出」，不会自动续接（避免一次性消耗额度）。文件损坏时会改名为 `state.json.corrupt-<时间戳>` 并从空状态启动。
+
+每次推送到 `main`（包括只改文档）都会排队发布 Windows 桌面端。CI 选择比源码和现有发布标签都大的 patch 版本，同步写入 `tauri.conf.json`、`Cargo.toml` 和 `Cargo.lock`，提交回 `main`，再从该提交编译安装包并公开 Release。自动生成的版本提交不会触发下一次构建。
 
 ## 使用
 

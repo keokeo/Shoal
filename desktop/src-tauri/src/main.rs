@@ -40,15 +40,16 @@ fn server_url() -> Url {
     Url::parse(&format!("http://127.0.0.1:{}/", port())).expect("valid server url")
 }
 
-// Same rule as server/main.ts: WORKBENCH_STATE_DIR, else %LOCALAPPDATA%\agent-workbench if an install from before the
-// rename left one, else %LOCALAPPDATA%\Shoal. The shell only needs it for the server's log files.
+// Same rule as server/main.ts: WORKBENCH_STATE_DIR, else %LOCALAPPDATA%\agent-workbench while an install from before the
+// rename left one and %LOCALAPPDATA%\Shoal has no state.json yet, else %LOCALAPPDATA%\Shoal. The Shoal folder alone says
+// nothing: the installer puts the app itself there. start_server passes the result on, so both sides use one folder.
 fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WORKBENCH_STATE_DIR") {
         return PathBuf::from(dir);
     }
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let old = base.join("agent-workbench");
-    if old.is_dir() { old } else { base.join("Shoal") }
+    let (dir, old) = (base.join("Shoal"), base.join("agent-workbench"));
+    if !dir.join("state.json").is_file() && old.is_dir() { old } else { dir }
 }
 
 // Minimal HTTP/1.0 client for the local server: 1.0 keeps Node from chunking the body. No Origin header, so the
@@ -110,6 +111,13 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
     let state = state_dir();
     std::fs::create_dir_all(&state).map_err(|e| format!("无法创建 {}：{e}", state.display()))?;
     let (out_path, err_path) = (state.join("server.log"), state.join("server.err.log"));
+    // Keep the previous run's logs: after a crash they hold the reason.
+    for (cur, prev) in [(&out_path, "server.prev.log"), (&err_path, "server.err.prev.log")] {
+        if cur.is_file() {
+            std::fs::rename(cur, state.join(prev))
+                .map_err(|e| format!("无法保留 {} 的上次运行日志：{e}", cur.display()))?;
+        }
+    }
     let out = File::create(&out_path).map_err(|e| format!("无法写入 {}：{e}", out_path.display()))?;
     let err = File::create(&err_path).map_err(|e| format!("无法写入 {}：{e}", err_path.display()))?;
     let mut child = Command::new(&node)
@@ -119,6 +127,8 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .env("WORKBENCH_BUNDLED", "1")
+        // The server must use the folder this shell reads its logs from.
+        .env("WORKBENCH_STATE_DIR", &state)
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(out)

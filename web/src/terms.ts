@@ -13,6 +13,8 @@ interface Entry {
   opened: boolean;
   sentCols: number;
   sentRows: number;
+  resizeTimer: number; // pending resize to the server (0 = none)
+  gl: WebglAddon | null; // see MAX_GL
   replaying: boolean; // writing the server's replay of earlier output
 }
 
@@ -157,7 +159,7 @@ function getEntry(id: string): Entry {
   term.loadAddon(fit);
   const el = document.createElement('div');
   el.className = 'term-host';
-  entry = { id, term, fit, el, opened: false, sentCols: 0, sentRows: 0, replaying: false };
+  entry = { id, term, fit, el, opened: false, sentCols: 0, sentRows: 0, resizeTimer: 0, gl: null, replaying: false };
   const self = entry;
   // Replayed output repeats copies made long ago (e.g. on a page reload); those must not overwrite the clipboard.
   term.parser.registerOscHandler(52, (data) => {
@@ -210,6 +212,8 @@ export function replay(id: string, d: string): void {
 export function dispose(id: string): void {
   const entry = registry.get(id);
   if (!entry) return;
+  clearTimeout(entry.resizeTimer);
+  glRecent = glRecent.filter((e) => e !== entry);
   entry.term.dispose();
   entry.el.remove();
   registry.delete(id);
@@ -227,28 +231,64 @@ export function attach(id: string, host: HTMLElement): void {
     entry.term.open(entry.el);
     entry.opened = true;
     pinIme(entry.term, entry.el);
+  }
+  glRecent = [...glRecent.filter((e) => e !== entry), entry];
+  if (!entry.gl) {
     try {
       const gl = new WebglAddon();
-      gl.onContextLoss(() => gl.dispose());
+      gl.onContextLoss(() => dropGl(entry));
       entry.term.loadAddon(gl);
+      entry.gl = gl;
     } catch {
       // fall back to the default renderer
     }
   }
+  trimGl();
   fitEntry(id);
   entry.term.refresh(0, entry.term.rows - 1);
 }
+
+// Browsers cap live WebGL contexts (Chrome: 16 per page) and past that silently kill the oldest, which may be a terminal
+// on screen (blank, then the DOM renderer). Keep a context only for the terminals shown most recently; hidden ones
+// beyond that fall back to the DOM renderer and get a new context when shown again.
+const MAX_GL = 8;
+let glRecent: Entry[] = []; // terminals by when they were last shown, oldest first
+
+function dropGl(entry: Entry): void {
+  const gl = entry.gl;
+  entry.gl = null;
+  gl?.dispose();
+}
+
+function trimGl(): void {
+  let live = glRecent.filter((e) => e.gl).length;
+  for (const e of glRecent) {
+    if (live <= MAX_GL) break;
+    if (!e.gl || e.el.isConnected) continue;
+    dropGl(e);
+    live--;
+  }
+  glRecent = glRecent.filter((e) => e.gl);
+}
+
+const RESIZE_SEND_MS = 100;
 
 export function fitEntry(id: string): void {
   const entry = registry.get(id);
   if (!entry || !entry.opened || !entry.el.isConnected || entry.el.clientWidth === 0) return;
   entry.fit.fit();
-  const { cols, rows } = entry.term;
-  if (cols !== entry.sentCols || rows !== entry.sentRows) {
+  if (entry.term.cols === entry.sentCols && entry.term.rows === entry.sentRows) return;
+  // Dragging a divider or the window refits on every frame; the CLI redraws on each PTY resize, so send the size it settles on.
+  clearTimeout(entry.resizeTimer);
+  entry.resizeTimer = window.setTimeout(() => {
+    entry.resizeTimer = 0;
+    if (!registry.has(id)) return;
+    const { cols, rows } = entry.term;
+    if (cols === entry.sentCols && rows === entry.sentRows) return;
     entry.sentCols = cols;
     entry.sentRows = rows;
     send({ t: 'resize', id, cols, rows });
-  }
+  }, RESIZE_SEND_MS);
 }
 
 // UI zoom: terminals follow the page scale, then refit (hidden ones refit when they are shown again).

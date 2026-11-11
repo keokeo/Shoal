@@ -25,6 +25,7 @@ interface SessState {
   start: number;
   lastAt: number;
   end?: number; // exit event
+  done?: boolean; // finished long enough ago and scanned once since: its files are skipped until it shows up again
   files: string[];
   models: [number, string][]; // model changes reported by hooks, by time
 }
@@ -58,6 +59,8 @@ const HOUR = 3_600_000;
 const START_SLACK = 2 * 60_000; // the first hook arrives a moment after the CLI starts
 const END_SLACK = 60_000;
 const OPEN_END = 10 * 60_000; // session died without an exit event (server killed): last hook + this
+const SETTLE = HOUR; // a session is done this long after the end of its run (owner() attributes nothing to it after that)
+export const EVENTS_ROTATE_BYTES = 10 * 1024 * 1024; // events.jsonl is moved to events.1.jsonl once read past this
 const SEEN_MAX = 300_000;
 const SCAN_MIN_MS = 2000;
 
@@ -122,18 +125,18 @@ function codexCounts(u: Obj): UsageCounts {
 }
 
 // Complete lines appended to `file` since `offset`; restarts from 0 if the file shrank. null if it cannot be read.
-function readNew(file: string, offset: number): { text: string; next: number } | null {
+function readNew(file: string, offset: number): { text: string; next: number; complete: boolean } | null {
   let fd: number;
   try { fd = fs.openSync(file, 'r'); } catch { return null; }
   try {
     const size = fs.fstatSync(fd).size;
     if (size < offset) offset = 0;
-    if (size === offset) return { text: '', next: offset };
+    if (size === offset) return { text: '', next: offset, complete: true };
     const buf = Buffer.alloc(size - offset);
     fs.readSync(fd, buf, 0, buf.length, offset);
     const nl = buf.lastIndexOf(0x0a);
-    if (nl < 0) return { text: '', next: offset };
-    return { text: buf.subarray(0, nl + 1).toString('utf8'), next: offset + nl + 1 };
+    if (nl < 0) return { text: '', next: offset, complete: false };
+    return { text: buf.subarray(0, nl + 1).toString('utf8'), next: offset + nl + 1, complete: nl + 1 === buf.length };
   } catch (e) {
     console.warn(`[usage] 读取 ${file} 失败：${(e as Error).message}`);
     return null;
@@ -165,12 +168,15 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
   const st = loadFile(file);
   const seen = new Set(st.seen);
   let lastScan = 0;
+  let savePending = false;
 
   const sess = (id: string, agent: AgentKind, at: number) =>
     (st.sessions[id] ??= { agent, start: at - START_SLACK, lastAt: at, files: [], models: [] });
   const addFile = (s: SessState, p: string) => {
     const f = normPath(p);
-    if (!s.files.includes(f)) s.files.push(f);
+    if (s.files.includes(f)) return;
+    s.files.push(f);
+    delete s.done; // a file learned late still gets read
   };
 
   function readEvents(): boolean {
@@ -185,6 +191,7 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       if (e.kind === 'hook') {
         const s = sess(e.sessionId, str(e.agent) as AgentKind, at);
         s.lastAt = Math.max(s.lastAt, at);
+        delete s.done;
         const p = isObj(e.payload) ? e.payload : {};
         const tp = str(p.transcript_path) || str(p.transcriptPath);
         if (tp) addFile(s, tp);
@@ -192,10 +199,32 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
         if (model && s.models.at(-1)?.[1] !== model) s.models.push([at, model]);
       } else if (e.kind === 'exit' && st.sessions[e.sessionId]) {
         st.sessions[e.sessionId].end = at;
+        delete st.sessions[e.sessionId].done;
       }
     }
     st.eventsOffset = r.next;
     return true;
+  }
+
+  // Checkpoint all metadata before removing its source events, with offset 0 for the next file. A crash before
+  // the rename then replays the old events safely; one after it starts the new file from its beginning.
+  // The server appends only on this thread, so nothing can land during this synchronous checkpoint and rename.
+  function rotateEvents() {
+    if (st.eventsOffset < EVENTS_ROTATE_BYTES) return;
+    try {
+      if (fs.statSync(eventsFile).size !== st.eventsOffset) return; // a partial last line: wait for the next scan
+      const offset = st.eventsOffset;
+      st.eventsOffset = 0;
+      if (!save()) { st.eventsOffset = offset; return; }
+      try {
+        fs.renameSync(eventsFile, path.join(o.stateDir, 'events.1.jsonl'));
+      } catch (e) {
+        st.eventsOffset = offset; // still reading the old file in this process; on disk it is safe to replay
+        throw e;
+      }
+    } catch (e) {
+      console.warn(`[usage] 无法轮转 ${eventsFile}：${(e as Error).message}`);
+    }
   }
 
   function syncStore(): boolean {
@@ -217,11 +246,14 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
   }
 
   // The session whose run covers time t, latest start first.
+  const runEnd = (id: string, s: SessState, live: Set<string>) =>
+    s.end !== undefined ? s.end + END_SLACK : live.has(id) ? Infinity : s.lastAt + OPEN_END;
+
   function owner(ids: string[], t: number, live: Set<string>): [string, SessState] | null {
     let best: [string, SessState] | null = null;
     for (const id of ids) {
       const s = st.sessions[id];
-      const end = s.end !== undefined ? s.end + END_SLACK : live.has(id) ? Infinity : s.lastAt + OPEN_END;
+      const end = runEnd(id, s, live);
       if (t >= s.start && t <= end && (!best || s.start > best[1].start)) best = [id, s];
     }
     return best;
@@ -233,10 +265,11 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     return m;
   };
 
-  function scanFile(f: string, ids: string[], live: Set<string>): boolean {
+  function scanFile(f: string, ids: string[], live: Set<string>): { changed: boolean; complete: boolean } {
     const fs0 = (st.files[f] ??= { offset: 0 });
     const r = readNew(f, fs0.offset);
-    if (!r || r.next === fs0.offset) return false;
+    if (!r) return { changed: false, complete: false };
+    if (r.next === fs0.offset) return { changed: false, complete: r.complete };
     for (const line of r.text.split('\n')) {
       if (!line.includes('_tokens"') && !line.includes('"turn_context"')) continue;
       let v: unknown;
@@ -254,7 +287,7 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       add((st.buckets[k] ??= zero()), hit.c);
     }
     fs0.offset = r.next;
-    return true;
+    return { changed: true, complete: r.complete };
   }
 
   function scan() {
@@ -268,21 +301,35 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       if (!ids.includes(id)) ids.push(id);
       byFile.set(f, ids);
     };
+    const settled: [string, SessState][] = [];
+    const incomplete = new Set<string>();
     for (const [id, s] of Object.entries(st.sessions)) {
+      if (live.has(id)) delete s.done;
+      if (s.done) continue;
+      // Only a complete scan may retire this session; unreadable files and partial lines need another attempt.
+      if (now() > runEnd(id, s, live) + SETTLE) settled.push([id, s]);
       for (const f of s.files) {
         link(f, id);
         if (s.agent !== 'claude' || !f.endsWith('.jsonl')) continue;
         const sub = path.join(f.slice(0, -'.jsonl'.length), 'subagents');
         let names: string[] = [];
-        try { names = fs.readdirSync(sub).filter(n => n.endsWith('.jsonl')); } catch { /* none */ }
+        try { names = fs.readdirSync(sub).filter(n => n.endsWith('.jsonl')); } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') incomplete.add(id);
+        }
         for (const n of names) link(path.join(sub, n), id);
       }
     }
-    for (const [f, ids] of byFile) if (scanFile(f, ids, live)) changed = true;
-    if (changed) save();
+    for (const [f, ids] of byFile) {
+      const r = scanFile(f, ids, live);
+      if (r.changed) changed = true;
+      if (!r.complete) for (const id of ids) incomplete.add(id);
+    }
+    for (const [id, s] of settled) if (!incomplete.has(id)) { s.done = true; changed = true; }
+    if ((changed || savePending) && !save()) return;
+    rotateEvents();
   }
 
-  function save() {
+  function save(): boolean {
     let keep = [...seen];
     if (keep.length > SEEN_MAX) {
       keep = keep.slice(-SEEN_MAX);
@@ -294,8 +341,12 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     try {
       fs.writeFileSync(tmp, JSON.stringify(st));
       fs.renameSync(tmp, file);
+      savePending = false;
+      return true;
     } catch (e) {
+      savePending = true;
       console.error(`[usage] 写入 ${file} 失败：`, (e as Error).message);
+      return false;
     }
   }
 

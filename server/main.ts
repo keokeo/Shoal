@@ -14,11 +14,13 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   process.exit(2);
 }
 
-// Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench (same rule in workbench.ps1).
+// Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench until Shoal has
+// its own state.json. The folder alone says nothing: the desktop installer puts the app itself in %LOCALAPPDATA%\Shoal.
+// Same rule in workbench.ps1 and desktop/src-tauri/src/main.rs (which also passes its choice in WORKBENCH_STATE_DIR).
 const defaultStateDir = () => {
   const base = process.env.LOCALAPPDATA ?? '.';
   const dir = path.join(base, 'Shoal'), old = path.join(base, 'agent-workbench');
-  return !fs.existsSync(dir) && fs.existsSync(old) ? old : dir;
+  return !fs.existsSync(path.join(dir, 'state.json')) && fs.existsSync(old) ? old : dir;
 };
 const stateDir = path.resolve(process.env.WORKBENCH_STATE_DIR ?? defaultStateDir());
 fs.mkdirSync(stateDir, { recursive: true });
@@ -38,6 +40,10 @@ server.listen(port, '127.0.0.1', () => {
   setTimeout(() => usage.scan(), 1000).unref();
   setInterval(() => usage.scan(), 60_000).unref();
 });
+
+// Node still prints the error and exits; this adds when it happened, so server.err.log (kept one restart back as
+// server.err.prev.log) says why the page lost its server.
+process.on('uncaughtExceptionMonitor', (e, origin) => console.error(`[${new Date().toISOString()}] ${origin}:`, e));
 
 // A second signal exits at once, without waiting for young claude sessions (see SessionManager.killAll).
 let stopping = false;

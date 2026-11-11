@@ -373,8 +373,8 @@ export function App() {
     };
   }, [jump, quickCreate]);
 
-  // Only the terminal in the focused pane holds DOM focus.
-  useEffect(() => {
+  // Focus after Pane attaches its terminal, before the browser paints the new session.
+  useLayoutEffect(() => {
     if (dialog) return;
     focusOnly(view === 'work' ? panes[layout === 1 ? 0 : focusedPane] : null);
   }, [panes, focusedPane, layout, dialog, focusTick, view]);

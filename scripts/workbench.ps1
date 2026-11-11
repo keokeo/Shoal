@@ -16,10 +16,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 if ($Port -le 0) { $Port = if ($env:WORKBENCH_PORT) { [int]$env:WORKBENCH_PORT } else { 47800 } }
-# Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench (same rule in server/main.ts).
+# Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench until Shoal has its
+# own state.json (the desktop installer puts the app itself in %LOCALAPPDATA%\Shoal). Same rule in server/main.ts.
 $StateDir = if ($env:WORKBENCH_STATE_DIR) { $env:WORKBENCH_STATE_DIR } else {
   $new = Join-Path $env:LOCALAPPDATA 'Shoal'; $old = Join-Path $env:LOCALAPPDATA 'agent-workbench'
-  if (-not (Test-Path $new) -and (Test-Path $old)) { $old } else { $new }
+  if (-not (Test-Path (Join-Path $new 'state.json')) -and (Test-Path $old)) { $old } else { $new }
 }
 $Url = "http://127.0.0.1:$Port"
 $Log = Join-Path $StateDir 'server.log'
@@ -75,6 +76,10 @@ function Start-Workbench {
     if (-not (Test-Path (Join-Path $Root 'node_modules'))) { Write-Host '首次运行，安装依赖…'; Invoke-Npm @('install') }
     if (Test-BuildNeeded) { Write-Host '前端有更新，正在构建…'; Invoke-Npm @('run', 'build') }
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    # Keep the previous run's logs: after a crash they hold the reason.
+    foreach ($f in @($Log, $ErrLog)) {
+      if (Test-Path $f) { Move-Item -Force $f ($f -replace '\.log$', '.prev.log') }
+    }
     # 独立的隐藏控制台：关掉这个窗口不会带走服务和 agent。
     $proc = Start-Process -FilePath 'node' -ArgumentList @('server/main.ts', '--port', "$Port") -WorkingDirectory $Root `
       -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru

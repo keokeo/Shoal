@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createUsage } from './usage.ts';
+import { createUsage, EVENTS_ROTATE_BYTES } from './usage.ts';
 import type { UsageSource } from './usage.ts';
 import { usageTotal, vendorOf } from '../shared/protocol.ts';
 import type { AgentKind, Project, SessionInfo, Task } from '../shared/protocol.ts';
@@ -14,7 +14,10 @@ beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-usage-'));
   src = { sessions: [], tasks: [], projects: [{ id: 'p1', name: '项目一', path: dir, createdAt: 0 }] };
 });
-afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 const T0 = Date.parse('2026-11-01T10:00:00Z');
 const MIN = 60_000;
@@ -141,11 +144,125 @@ describe('usage', () => {
     expect(u.report(T0 + 4 * 60 * MIN, null).total.requests).toBe(0);
   });
 
+  it('scans a finished session once more after it settles, then skips it until it shows up again', () => {
+    addTask('t1', '旧任务', 's1', 'claude', T0, 'exited');
+    const f = write('claude/d.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 1, output_tokens: 1 })));
+    hook('s1', 'claude', T0 + 10_000, { transcript_path: f });
+    event({ kind: 'exit', sessionId: 's1', agent: 'claude', exitCode: 0, at: T0 + 5 * MIN });
+    let now = T0 + 3 * 60 * MIN; // long settled already: the first scan still counts it (an upgrade or a rebuilt usage.json)
+    const u = createUsage({ stateDir: dir, source, now: () => now });
+    u.scan();
+    expect(u.report(null, null).total.requests).toBe(1);
+
+    // Skipped now: a line that falls inside its run is not read...
+    write('claude/d.jsonl', lines(claudeLine('m2', T0 + 2 * MIN, { input_tokens: 2, output_tokens: 2 })));
+    now += 10 * MIN;
+    expect(u.report(null, null).total.requests).toBe(1);
+    // ...until the session is active again (resumed under the same id): then the file is read on from where it stopped.
+    hook('s1', 'claude', now, { transcript_path: f });
+    now += 10 * MIN;
+    expect(u.report(null, null).total).toMatchObject({ input: 3, requests: 2 });
+  });
+
+  it('moves a fully read events.jsonl aside once it is large and reads the new one from the start', () => {
+    addTask('t1', '大日志', 's1', 'claude', T0);
+    const f = write('claude/r.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 1, output_tokens: 1 })));
+    hook('s1', 'claude', T0 + 10_000, { transcript_path: f, pad: 'x'.repeat(EVENTS_ROTATE_BYTES) });
+    let now = T0 + 5 * MIN;
+    const u = createUsage({ stateDir: dir, source, now: () => now });
+    u.scan();
+    expect(fs.existsSync(path.join(dir, 'events.jsonl'))).toBe(false);
+    expect(fs.statSync(path.join(dir, 'events.1.jsonl')).size).toBeGreaterThan(EVENTS_ROTATE_BYTES);
+
+    // A session known only from the new file is still found, and nothing already counted is counted twice.
+    const g = write('claude/r2.jsonl', lines(claudeLine('m2', T0 + 6 * MIN, { input_tokens: 2, output_tokens: 2 })));
+    hook('gone', 'claude', T0 + 5 * MIN, { transcript_path: g });
+    now += 10 * MIN;
+    expect(u.report(null, null).total).toMatchObject({ input: 3, requests: 2 });
+    expect(createUsage({ stateDir: dir, source, now: () => now }).report(null, null).total).toMatchObject({ input: 3, requests: 2 });
+  });
+
   it('attributes sessions known only from events.jsonl to an unknown task', () => {
     const f = write('claude/e.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 4, output_tokens: 4 })));
     hook('gone', 'claude', T0, { transcript_path: f });
     const r = createUsage({ stateDir: dir, source }).report(null, null);
     expect(r.byTask).toMatchObject([{ key: '', deleted: true, input: 4 }]);
+  });
+
+  it.each(['restart', 'retry'] as const)('keeps events recoverable when persistence fails at rotation (%s)', (recovery) => {
+    const f = write('claude/recover.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 11, output_tokens: 7 })));
+    hook('gone', 'claude', T0, { transcript_path: f, pad: 'x'.repeat(EVENTS_ROTATE_BYTES) });
+    const blocked = path.join(dir, 'usage.json.tmp');
+    fs.mkdirSync(blocked);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const u = createUsage({ stateDir: dir, source, now: () => T0 + 10 * MIN });
+    u.scan();
+    expect(errors).toHaveBeenCalled();
+    expect(u.report(null, null).total.requests).toBe(1);
+    expect(fs.existsSync(path.join(dir, 'events.jsonl'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'events.1.jsonl'))).toBe(false);
+    fs.rmdirSync(blocked);
+    const recovered = recovery === 'retry' ? u : createUsage({ stateDir: dir, source, now: () => T0 + 10 * MIN });
+    recovered.scan();
+    expect(fs.existsSync(path.join(dir, 'events.jsonl'))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'usage.json'), 'utf8')).eventsOffset).toBe(0);
+    fs.rmSync(f); // no transcript left to rebuild lost totals from
+    expect(createUsage({ stateDir: dir, source }).report(null, null).total).toMatchObject({ input: 11, requests: 1 });
+  });
+
+  it('retries an unchanged usage checkpoint after a failed save', () => {
+    const f = write('claude/retry.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 3 })));
+    hook('gone', 'claude', T0, { transcript_path: f });
+    const blocked = path.join(dir, 'usage.json.tmp');
+    fs.mkdirSync(blocked);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const u = createUsage({ stateDir: dir, source });
+    u.scan();
+    fs.rmdirSync(blocked);
+    u.scan();
+    fs.rmSync(f);
+    fs.rmSync(path.join(dir, 'events.jsonl'));
+    expect(createUsage({ stateDir: dir, source }).report(null, null).total.requests).toBe(1);
+  });
+
+  it('can replay the old event file after a failed rename without duplicating usage', () => {
+    const f = write('claude/rename.jsonl', lines(claudeLine('m1', T0 + MIN, { input_tokens: 3 })));
+    const eventsFile = hook('gone', 'claude', T0, { transcript_path: f, pad: 'x'.repeat(EVENTS_ROTATE_BYTES) });
+    const rename = fs.renameSync;
+    const fail = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (from === eventsFile) throw new Error('simulated rename failure');
+      rename(from, to);
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    createUsage({ stateDir: dir, source }).scan();
+    expect(fs.existsSync(eventsFile)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'usage.json'), 'utf8')).eventsOffset).toBe(0);
+    fail.mockRestore();
+    expect(createUsage({ stateDir: dir, source }).report(null, null).total.requests).toBe(1);
+    expect(fs.existsSync(eventsFile)).toBe(false);
+  });
+
+  it.each(['main', 'subagent', 'partial'] as const)('retries a settled session until its %s transcript is fully read', (failure) => {
+    const body = lines(claudeLine('m1', T0 + MIN, { input_tokens: 5, output_tokens: 2 }));
+    const main = write('claude/settled.jsonl', failure === 'main' ? '' : failure === 'partial' ? body.slice(0, 20) : '');
+    const target = failure === 'subagent' ? write('claude/settled/subagents/agent-1.jsonl', body) : main;
+    hook('gone', 'claude', T0, { transcript_path: main });
+    event({ kind: 'exit', sessionId: 'gone', agent: 'claude', at: T0 + 5 * MIN });
+    const open = fs.openSync;
+    const fail = vi.spyOn(fs, 'openSync').mockImplementation((file, flags, mode) => {
+      if (failure !== 'partial' && file === target) throw new Error('temporarily unavailable');
+      return open(file, flags, mode);
+    });
+    const u = createUsage({ stateDir: dir, source });
+    u.scan();
+    expect(u.report(null, null).total.requests).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'usage.json'), 'utf8')).sessions.gone.done).not.toBe(true);
+    fail.mockRestore();
+    if (failure !== 'subagent') write('claude/settled.jsonl', failure === 'partial' ? body.slice(20) : body);
+    // Restart without new hook events: only persisted retry state can discover the recovered file.
+    const restarted = createUsage({ stateDir: dir, source });
+    expect(restarted.report(null, null).total).toMatchObject({ input: 5, requests: 1 });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'usage.json'), 'utf8')).sessions.gone.done).toBe(true);
   });
 
   it('infers the vendor from the model name before the CLI', () => {

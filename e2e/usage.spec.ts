@@ -130,8 +130,11 @@ test.describe('Token 统计与缩放', () => {
     await row(page, session.id).click();
     await expect.poll(() => termText(page, session.id)).toContain('FAKE AGENT');
     const cols = async () => (await state(request)).sessions.find((s) => s.id === session.id)!.cols;
-    await expect.poll(cols).toBeGreaterThan(60);
+    // The page sends a size once it settles: wait until the server has the fitted one, not the spawn default.
+    const termCols = () => page.evaluate((id) => (window as any).__wbTermSize(id).cols as number, session.id);
+    await expect.poll(async () => (await cols()) === (await termCols())).toBe(true);
     const cols100 = await cols();
+    expect(cols100).toBeGreaterThan(60);
     const rootPx = () => page.evaluate(() => getComputedStyle(document.documentElement).fontSize);
     const termPx = () => page.evaluate((id) => window.__wbTermFontSize?.(id), session.id);
     expect(await rootPx()).toBe('16px');
