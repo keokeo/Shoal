@@ -10,7 +10,8 @@ import type { AgentKind } from '../shared/protocol.ts';
 function shortPath(p: string): string {
   if (!p.includes(' ') || process.platform !== 'win32') return p;
   try {
-    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true }).trim();
+    // Verbatim: Node would otherwise escape the quotes as \" and cmd reads them literally.
+    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true }).trim();
     return out && fs.existsSync(out) ? out : p;
   } catch {
     return p;
