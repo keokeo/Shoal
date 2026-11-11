@@ -94,8 +94,8 @@ export function handoffPrompt(task: Pick<Task, 'title'>, card: string, o: { from
   ].join('\n');
 }
 
-// Runs the target agent headless to write the card. Null on any failure (logged); never throws.
-export async function generateCard(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number }): Promise<string | null> {
+// Runs the agent headless once on the prompt and returns its trimmed output. Null on any failure (logged with `what`); never throws.
+export async function runHeadless(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number; what: string }): Promise<string | null> {
   const outFile = path.join(o.stateDir, 'handoff', `${crypto.randomUUID()}.md`);
   const launch = buildGenerator(agent, prompt, outFile);
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k)));
@@ -129,9 +129,14 @@ export async function generateCard(agent: AgentKind, prompt: string, o: { cwd: s
     if (!text) throw new Error('输出为空');
     return text;
   } catch (e) {
-    console.warn(`[handoff] ${agent} 生成交接卡片失败：${(e as Error).message}`);
+    console.warn(`[handoff] ${agent} ${o.what}失败：${(e as Error).message}`);
     return null;
   } finally {
     if (launch.outFile) fs.rmSync(launch.outFile, { force: true });
   }
+}
+
+// Runs the target agent headless to write the card. Null on any failure (logged); never throws.
+export function generateCard(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number }): Promise<string | null> {
+  return runHeadless(agent, prompt, { ...o, what: '生成交接卡片' });
 }

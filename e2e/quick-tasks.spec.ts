@@ -88,7 +88,7 @@ test('项目旁 + 快捷新建：不弹窗、标题自动取第一句、可双�
   expect(t1.title).toBe('新任务 1');
   expect(t1.titleAuto).toBe(true);
   const s1 = t1.sessionId!;
-  await expectStatus(page, s1, 'needs_you');
+  await expectStatus(page, s1, 'idle');
   await expect(pane(page, 0)).toHaveAttribute('data-session-id', s1);
   // The row and the pane header carry the agent's icon.
   await expect(page.locator(`[data-testid="task-row"][data-session-id="${s1}"] [data-testid="agent-icon"]`)).toHaveAttribute('data-agent', 'fake');
@@ -191,8 +191,8 @@ test('改名 API：非法输入被拒，合法改名同步到已打开的页面'
 test('折叠项目：等你的任务仍有提示，Alt+` 自动展开；Alt+N 在当前项目用上次的 agent 新建', async ({ page }) => {
   const p1 = await createProject(page.request, token('fold-a'));
   const p2 = await createProject(page.request, token('fold-b'));
-  const a = await createFakeTask(page.request, p1.id, 'A 项目任务');
-  const b = await createFakeTask(page.request, p2.id, 'B 项目任务');
+  const a = await createFakeTask(page.request, p1.id, 'A 项目任务', 'hi');
+  const b = await createFakeTask(page.request, p2.id, 'B 项目任务', 'hi');
   await page.goto('/');
   await expectStatus(page, a.session.id, 'needs_you');
   await expectStatus(page, b.session.id, 'needs_you');
@@ -200,7 +200,8 @@ test('折叠项目：等你的任务仍有提示，Alt+` 自动展开；Alt+N �
   await group(page, p1.id).getByTestId('project-toggle').click();
   await expect(group(page, p1.id)).toHaveAttribute('data-collapsed', 'true');
   await expect(row(page, a.session.id)).toHaveCount(0);
-  await expect(group(page, p1.id).getByTestId('group-needs')).toHaveText('1 个在等你');
+  // A finished its turn: 待验收 counts as waiting (a fresh 就绪 session would not).
+  await expect(group(page, p1.id).getByTestId('group-review')).toHaveText('1 待验收');
   await expect(row(page, b.session.id)).toBeVisible(); // other project untouched
   await page.screenshot({ path: path.join(OUT, 'collapsed.png') });
 
@@ -231,7 +232,7 @@ test('折叠项目：等你的任务仍有提示，Alt+` 自动展开；Alt+N �
   // The shortcut itself never reached A's CLI.
   await row(page, a.session.id).click();
   await page.keyboard.type('probe\r');
-  await expect.poll(() => fakeLines(a.session.id)).toEqual(['probe']);
+  await expect.poll(() => fakeLines(a.session.id)).toEqual(['hi', 'probe']);
 
   // Focus a session in project 2 -> Alt+N creates there.
   await layoutDual(page);
@@ -243,6 +244,6 @@ test('折叠项目：等你的任务仍有提示，Alt+` 自动展开；Alt+N �
 });
 
 async function layoutDual(page: Page) {
-  await page.getByTestId('layout-toggle').click();
+  await page.getByTestId('layout-2').click();
   await expect(page.getByTestId('pane')).toHaveCount(2);
 }

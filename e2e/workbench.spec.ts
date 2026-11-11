@@ -9,7 +9,8 @@
 // 4. Hook events from 6 concurrent sessions get mixed up -> each row reaches its own status and
 //    nativeSessionId equals `fake-<its id>`.
 // 5. Ctrl+C interrupts a turn but no Stop hook arrives -> status still becomes needs_you.
-// 6. Permission prompt / startup with no prompt / process exit -> needs_you / needs_you (quiet) / exited.
+// 6. Permission prompt / startup with no prompt / process exit -> needs_you / idle (SessionStart, 就绪) / exited.
+//    (A CLI that never reports SessionStart still leaves 启动中 via the 4 s quiet fallback: server/status.test.ts.)
 // 7. Alt+` order -> oldest needs_you first, wraps; the shortcut is not delivered to the CLI.
 // 8. Browser reload -> tasks, statuses and terminal history come back; routing still correct.
 // 9. Other local web pages drive the terminals -> foreign-origin WS/API rejected, /hook needs the token.
@@ -108,7 +109,7 @@ test('dual panes: input follows the focused pane; picking a shown session focuse
   await expectStatus(page, a.id, 'needs_you');
   await expectStatus(page, b.id, 'needs_you');
 
-  await page.getByTestId('layout-toggle').click();
+  await page.getByTestId('layout-2').click();
   await pane(page, 0).click();
   await row(page, a.id).click();
   await pane(page, 1).click();
@@ -166,7 +167,7 @@ test('status edge cases: Ctrl+C, permission prompt, no prompt, crash exit', asyn
   await expect.poll(() => termText(page, ask.id)).toContain('reply: ask');
   await expectStatus(page, ask.id, 'needs_you');
 
-  await expectStatus(page, idle.id, 'needs_you', 10_000); // quiet fallback, no hook ever fired
+  await expectStatus(page, idle.id, 'idle'); // SessionStart, no prompt: 就绪, not 需要你
   await expectStatus(page, crash.id, 'exited');
   expect((await state(request)).sessions.find(s => s.id === crash.id)!.exitCode).toBe(3);
 });

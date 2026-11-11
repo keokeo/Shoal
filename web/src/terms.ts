@@ -25,7 +25,21 @@ const fontSize = () => Math.round(BASE_FONT * scale);
 const altOnly = (e: KeyboardEvent) => e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
 export const isJumpKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'Backquote';
 export const isNewTaskKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyN';
-const isPageKey = (e: KeyboardEvent) => isJumpKey(e) || isNewTaskKey(e);
+// Alt+1 / Alt+2 focus the left / right pane: 0 / 1; null for any other key.
+export const isPaneKey = (e: KeyboardEvent): 0 | 1 | null => (altOnly(e) ? (e.code === 'Digit1' ? 0 : e.code === 'Digit2' ? 1 : null) : null);
+export const isSearchKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyK';
+const ctrlOnly = (e: KeyboardEvent) => e.ctrlKey && !e.altKey && !e.metaKey;
+// Ctrl+= / Ctrl++ (numpad too) zoom in, Ctrl+- out, Ctrl+0 back to 100%: 1 / -1 / 0; null for any other key.
+// Shift is allowed because + is Shift+= on most layouts.
+export function zoomKey(e: KeyboardEvent): 1 | -1 | 0 | null {
+  if (!ctrlOnly(e)) return null;
+  if (e.code === 'Equal' || e.code === 'NumpadAdd') return 1;
+  if (e.code === 'Minus' || e.code === 'NumpadSubtract') return -1;
+  if ((e.code === 'Digit0' || e.code === 'Numpad0') && !e.shiftKey) return 0;
+  return null;
+}
+// Ctrl+- stays with the CLI inside a terminal: it is ^_, Claude Code's undo.
+const isPageKey = (e: KeyboardEvent) => isJumpKey(e) || isNewTaskKey(e) || isPaneKey(e) !== null || isSearchKey(e) || zoomKey(e) === 1 || zoomKey(e) === 0;
 const isPasteKey = (e: KeyboardEvent) => e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && e.code === 'KeyV';
 
 let notice: (msg: string) => void = () => {};

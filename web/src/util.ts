@@ -2,6 +2,7 @@ import type { SessionStatus } from '../../shared/protocol.ts';
 
 export const STATUS_LABEL: Record<SessionStatus, string> = {
   starting: '启动中',
+  idle: '就绪',
   working: '工作中',
   needs_you: '需要你',
   exited: '已退出',

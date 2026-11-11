@@ -13,7 +13,20 @@ describe('reduceStatus', () => {
     expect(reduceStatus('working', hook(ev))).toBe('needs_you');
   });
 
-  it.each(['SessionStart', 'PostInvocation', 'Whatever'])('%s leaves status unchanged', ev => {
+  it('SessionStart makes a starting session idle and is ignored later', () => {
+    expect(reduceStatus('starting', hook('SessionStart'))).toBe('idle');
+    for (const s of ['idle', 'working', 'needs_you'] as SessionStatus[]) expect(reduceStatus(s, hook('SessionStart'))).toBe(s);
+  });
+
+  it('idle: Notification keeps it idle, a turn or a stop moves it on', () => {
+    expect(reduceStatus('idle', hook('Notification'))).toBe('idle');
+    expect(reduceStatus('idle', hook('UserPromptSubmit'))).toBe('working');
+    expect(reduceStatus('idle', hook('PermissionRequest'))).toBe('needs_you');
+    expect(reduceStatus('idle', { type: 'quiet' })).toBe('idle');
+    expect(reduceStatus('idle', { type: 'input', data: '\x03' })).toBe('idle');
+  });
+
+  it.each(['PostInvocation', 'Whatever'])('%s leaves status unchanged', ev => {
     for (const s of ['starting', 'working', 'needs_you'] as SessionStatus[]) expect(reduceStatus(s, hook(ev))).toBe(s);
   });
 

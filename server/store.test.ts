@@ -140,4 +140,16 @@ describe('file store', () => {
     expect(s.cards()).toEqual([]);
     expect(s.sessions()[0]).not.toHaveProperty('queued');
   });
+
+  it('settings default to aiTitles off, survive a reload, and fall back to the default for missing or invalid values', () => {
+    const a = createFileStore(file);
+    expect(a.settings()).toEqual({ aiTitles: false });
+    a.setSettings({ aiTitles: true });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: true });
+    const base = { version: 1, projects: [], tasks: [], sessions: [] };
+    fs.writeFileSync(file, JSON.stringify(base));
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false });
+    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { aiTitles: 'yes' } }));
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false });
+  });
 });

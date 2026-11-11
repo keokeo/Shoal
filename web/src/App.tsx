@@ -1,20 +1,22 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, Project, ResumeResult, ServerMsg, SessionInfo, Snapshot, SwitchResult, Task,
+  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { AGENT_LABEL, canResume } from '../../shared/protocol.ts';
+import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
 import { connect } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isJumpKey, isNewTaskKey, replay, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
 import { Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { setPrivacy, usePrivacy } from './privacy.ts';
-import { ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
+import { ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
 import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { StatsView } from './Stats.tsx';
+import { TaskSearch } from './TaskSearch.tsx';
 
 type PaneSessions = [string | null, string | null];
-type Dialog = 'project' | 'task' | 'switch' | 'forward' | null;
+type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'search' | 'settings' | null;
+type SideFilter = 'active' | 'all';
 type View = 'work' | 'stats';
 
 declare global {
@@ -30,6 +32,8 @@ const upsert = <T extends { id: string }>(list: T[], item: T): T[] =>
 
 const COLLAPSED_KEY = 'wb.collapsed';
 const ARCHIVE_OPEN_KEY = 'wb.archiveOpen';
+const FILTER_KEY = 'wb.sideFilter';
+const loadFilter = (): SideFilter => (localStorage.getItem(FILTER_KEY) === 'active' ? 'active' : 'all');
 function loadCollapsed(): Set<string> {
   try {
     const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? '[]');
@@ -102,7 +106,7 @@ function defaultAgentFor(d: Snapshot, projectId: string): AgentKind {
 }
 
 export function App() {
-  const [data, setData] = useState<Snapshot>({ projects: [], tasks: [], sessions: [], cards: [], agents: [] });
+  const [data, setData] = useState<Snapshot>({ projects: [], tasks: [], sessions: [], cards: [], agents: [], settings: DEFAULT_SETTINGS });
   const [panes, setPanes] = useState<PaneSessions>([null, null]);
   const [focusedPane, setFocusedPane] = useState(0);
   const [layout, setLayout] = useState<1 | 2>(1);
@@ -119,6 +123,7 @@ export function App() {
   const privacy = usePrivacy();
   const [order, setOrder] = useState(loadOrder);
   const [sideW, setSideW] = useState(loadSide);
+  const [filter, setFilter] = useState<SideFilter>(loadFilter);
   const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
 
   // Latest state for handlers registered once (WebSocket, window listeners).
@@ -136,6 +141,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(SIDE_KEY, String(sideW));
   }, [sideW]);
+
+  useEffect(() => {
+    localStorage.setItem(FILTER_KEY, filter);
+  }, [filter]);
 
   useEffect(() => {
     localStorage.setItem(ARCHIVE_OPEN_KEY, archiveOpen ? '1' : '0');
@@ -177,6 +186,11 @@ export function App() {
 
   const needsYou = needsList(data);
   const reviewing = reviewList(data);
+  // "(3) Shoal" in the tab / taskbar; the desktop shell also flashes the taskbar button when the number grows.
+  const waitingCount = needsYou.length + reviewing.length;
+  useEffect(() => {
+    document.title = waitingCount ? `(${waitingCount}) Shoal` : 'Shoal';
+  }, [waitingCount]);
 
   // Opens the next session of the list after the focused one (the first if the focused one is not in it).
   const cycle = useCallback((pick: (d: Snapshot) => string[]) => {
@@ -255,6 +269,9 @@ export function App() {
       case 'project-removed':
         removeProjectLocal(msg.id);
         break;
+      case 'settings':
+        setData((d) => ({ ...d, settings: msg.settings }));
+        break;
       case 'card':
         setData((d) => ({ ...d, cards: upsert(d.cards, msg.card) }));
         break;
@@ -295,12 +312,36 @@ export function App() {
     window.__wbTermSize = sizeOf;
     setTermNotice(setNotice);
     const onKey = (e: KeyboardEvent) => {
+      const zoom = zoomKey(e);
+      const inTerm = e.target instanceof Element && !!e.target.closest('.xterm');
+      if (zoom !== null && !(zoom === -1 && inTerm)) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.type === 'keydown') zoom ? zoomBy(zoom) : setScale(100);
+        return;
+      }
+      const paneKey = isPaneKey(e);
+      const isSearch = isSearchKey(e);
       const isJump = isJumpKey(e);
       const isNew = isNewTaskKey(e);
-      if (!isJump && !isNew) return;
+      if (paneKey === null && !isSearch && !isJump && !isNew) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.type !== 'keydown' || e.repeat) return;
+      if (paneKey !== null) {
+        const s = live.current;
+        if (s.layout === 2 && !s.dialog) {
+          setFocusedPane(paneKey);
+          setFocusTick((n) => n + 1);
+        }
+        return;
+      }
+      if (isSearch) {
+        const s = live.current;
+        if (s.dialog === 'search') setDialog(null);
+        else if (!s.dialog) setDialog('search');
+        return;
+      }
       if (isJump) return jump();
       const s = live.current;
       if (s.dialog) return;
@@ -310,6 +351,14 @@ export function App() {
       if (projectId) void quickCreate(projectId, defaultAgentFor(s.data, projectId));
     };
     window.addEventListener('keydown', onKey, true);
+    // Ctrl+wheel zooms the whole UI anywhere, terminals included (they never see it).
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey || !e.deltaY) return;
+      e.preventDefault();
+      e.stopPropagation();
+      zoomBy(e.deltaY < 0 ? 1 : -1);
+    };
+    window.addEventListener('wheel', onWheel, { capture: true, passive: false });
     const onUnload = (e: BeforeUnloadEvent) => {
       if (live.current.data.sessions.some((s) => s.status !== 'exited')) {
         e.preventDefault();
@@ -319,6 +368,7 @@ export function App() {
     window.addEventListener('beforeunload', onUnload);
     return () => {
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('wheel', onWheel, true);
       window.removeEventListener('beforeunload', onUnload);
     };
   }, [jump, quickCreate]);
@@ -419,6 +469,15 @@ export function App() {
     }
   };
 
+  // Search palette result: archived tasks are restored first, then the session is shown like a sidebar click.
+  const openFound = async (task: Task) => {
+    setDialog(null);
+    setFocusTick((n) => n + 1);
+    if (task.phase === 'archived') await setPhase(task, 'unarchive');
+    if (task.sessionId) showSession(task.sessionId);
+    else setNotice(`任务「${task.title}」没有会话`);
+  };
+
   // Feedback on a finished task. A new session takes the old one's pane, like resume; true = sent.
   const sendFeedback = async (task: Task, text: string, mode: FeedbackBody['mode']): Promise<boolean> => {
     const s = live.current;
@@ -484,7 +543,7 @@ export function App() {
       dispose(old);
     }
     setDialog(null);
-    const waiting = !!r.session.queued && r.session.status !== 'needs_you';
+    const waiting = !!r.session.queued && r.session.status === 'working';
     setNotice(!target ? `已转发到新任务「${r.task.title}」`
       : waiting ? `已转发到「${r.task.title}」，它还在工作，消息排队中，空闲后自动发送`
       : `已转发到「${r.task.title}」`);
@@ -550,8 +609,7 @@ export function App() {
         </button>
         <div className="top-right">
           {/* Stepper, not a slider: the slider's rem width changed under the cursor while dragging. */}
-          <div className="zoom" title="界面缩放：点 −/+ 或在这里滚动滚轮，每次 5%；点数字恢复 100%" onWheel={(e) => e.deltaY && zoomBy(e.deltaY < 0 ? 1 : -1)}>
-            <span className="muted">缩放</span>
+          <div className="zoom" title="界面缩放，每次 5%：Ctrl+滚轮、Ctrl+= / Ctrl+-（终端里的 Ctrl+- 留给 CLI），Ctrl+0 恢复 100%；也可以点 −/+" onWheel={(e) => e.deltaY && zoomBy(e.deltaY < 0 ? 1 : -1)}>
             <button className="ghost zoom-step" data-testid="zoom-out" aria-label="缩小" disabled={scale <= SCALE_MIN} onClick={() => zoomBy(-1)}>−</button>
             <button className="ghost zoom-val" data-testid="zoom-value" aria-label="恢复 100%" onClick={() => setScale(100)}>{scale}%</button>
             <button className="ghost zoom-step" data-testid="zoom-in" aria-label="放大" disabled={scale >= SCALE_MAX} onClick={() => zoomBy(1)}>+</button>
@@ -563,8 +621,26 @@ export function App() {
             title="隐私模式：给项目名、任务标题、路径和摘要打码，方便截图分享"
             onClick={() => setPrivacy(!privacy)}
           >隐私</button>
-          <button className="ghost" data-testid="layout-toggle" disabled={view !== 'work'} title="切换单屏 / 双屏" onClick={toggleLayout}>
-            <span className={`layout-icon l${layout}`} />{layout === 1 ? '单屏' : '双屏'}
+          <span className="seg" role="radiogroup" aria-label="布局">
+            {([1, 2] as const).map((n) => (
+              <button
+                key={n}
+                role="radio"
+                aria-checked={layout === n}
+                className={`ghost seg-btn ${layout === n ? 'on' : ''}`}
+                data-testid={`layout-${n}`}
+                disabled={view !== 'work'}
+                title={n === 1 ? '单屏' : '双屏：左右两屏，点屏幕或 Alt+1 / Alt+2 切换左右屏'}
+                onClick={() => layout !== n && toggleLayout()}
+              >
+                <span className={`layout-icon l${n}`} />{n === 1 ? '单屏' : '双屏'}
+              </button>
+            ))}
+          </span>
+          <button className="icon-btn" data-testid="settings-btn" aria-label="设置" title="设置" onClick={() => setDialog('settings')}>
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <path d="M2 4.5h6.5M11.5 4.5H14M2 11.5h2.5M7.5 11.5H14" /><circle cx="10" cy="4.5" r="1.5" /><circle cx="6" cy="11.5" r="1.5" />
+            </svg>
           </button>
         </div>
       </header>
@@ -595,7 +671,23 @@ export function App() {
           }}
         />
         <div className="side-head">
-          <span className="side-title">项目</span>
+          {/* The filter takes the place of the old 项目 label: the head was too crowded for both. */}
+          <span className="seg side-filter" role="radiogroup" aria-label="任务筛选">
+            {([['active', '活跃'], ['all', '全部']] as const).map(([k, label]) => (
+              <button
+                key={k}
+                role="radio"
+                aria-checked={filter === k}
+                className={`ghost seg-btn ${filter === k ? 'on' : ''}`}
+                data-testid={`filter-${k}`}
+                title={k === 'active' ? '隐藏已退出的任务（待验收的保留）' : '显示所有任务'}
+                onClick={() => setFilter(k)}
+              >{label}</button>
+            ))}
+          </span>
+          <button className="icon-btn" data-testid="search-btn" aria-label="搜索任务" title="搜索任务（Alt+K）" onClick={() => setDialog('search')}>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="M10.25 10.25L13.5 13.5" /></svg>
+          </button>
           <button className="ghost" data-testid="new-project-btn" onClick={() => setDialog('project')}>新建项目</button>
           <button className="ghost" data-testid="new-task-btn" title="新建任务（Alt+N：在当前项目用上次的 agent 直接新建）" disabled={!data.projects.length} onClick={() => setDialog('task')}>新建任务</button>
         </div>
@@ -614,6 +706,8 @@ export function App() {
               visibleIds={visibleIds}
               focusedId={focusedSessionId}
               now={now}
+              filter={filter}
+              onShowAll={() => setFilter('all')}
               collapsed={collapsed.has(project.id)}
               agents={data.agents as AgentKind[]}
               defaultAgent={defaultAgentFor(data, project.id)}
@@ -706,6 +800,27 @@ export function App() {
           }}
         />
       )}
+      {dialog === 'search' && (
+        <TaskSearch
+          tasks={data.tasks}
+          projects={sortedProjects}
+          sessionsById={sessionsById}
+          onPick={(t) => void openFound(t)}
+          onClose={() => {
+            setDialog(null);
+            setFocusTick((n) => n + 1);
+          }}
+        />
+      )}
+      {dialog === 'settings' && (
+        <SettingsDialog
+          settings={data.settings}
+          onClose={() => {
+            setDialog(null);
+            setFocusTick((n) => n + 1);
+          }}
+        />
+      )}
       {dialog === 'switch' && tasksById.get(dialogTarget) && (
         <SwitchDialog
           task={tasksById.get(dialogTarget)!}
@@ -730,13 +845,15 @@ export function App() {
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, collapsed, agents, defaultAgent, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
   visibleIds: (string | null)[];
   focusedId: string | null; // session in the focused pane
   now: number;
+  filter: SideFilter;
+  onShowAll(): void;
   collapsed: boolean;
   agents: AgentKind[];
   defaultAgent: AgentKind;
@@ -754,10 +871,15 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   const [edge, setEdge] = useState<'before' | 'after' | null>(null); // insertion line while another project is dragged over
   const [menu, setMenu] = useState(false);
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
+  const reviewing = tasks.filter((t) => t.phase === 'review').length;
   // Running tasks first, then approved (done, session still open), stopped last; creation order within each.
   // Status changes inside a band (working / needs you / review) never move a row under the cursor.
   const band = (t: Task) => ((t.sessionId && sessionsById.get(t.sessionId)?.status) ?? 'exited') === 'exited' ? 2 : t.phase === 'approved' ? 1 : 0;
   tasks = [...tasks].sort((a, b) => band(a) - band(b));
+  // 活跃: stopped tasks are hidden, except 待验收 ones (the process ending does not settle the result).
+  const stopped = (t: Task) => band(t) === 2 && t.phase !== 'review';
+  const shown = filter === 'active' ? tasks.filter((t) => !stopped(t)) : tasks;
+  const hidden = tasks.length - shown.length;
   const row = (task: Task) => (
     <TaskRow
       key={task.id}
@@ -808,9 +930,9 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
         <button className="group-toggle" data-testid="project-toggle" title={privacy ? undefined : project.path} aria-expanded={!collapsed} onClick={onToggle}>
           <svg className="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
           <span className="group-name" data-private="">{project.name}</span>
-          {collapsed && waiting > 0
-            ? <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>
-            : collapsed && <span className="group-count">{tasks.length || ''}</span>}
+          {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
+          {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
+          {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.length || ''}</span>}
         </button>
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
@@ -839,7 +961,10 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
           )}
         </div>
       </div>
-      {!collapsed && tasks.map(row)}
+      {!collapsed && shown.map(row)}
+      {!collapsed && hidden > 0 && (
+        <button className="group-hidden" data-testid="group-hidden" onClick={onShowAll}>另有 {hidden} 个已退出</button>
+      )}
       {!collapsed && !tasks.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
     </section>
   );
@@ -958,6 +1083,7 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
   onUnarchive(): void;
 }) {
   const status = session?.status ?? 'exited';
+  const glyph = rowGlyph(task, session);
   const [editing, setEditing] = useState(false);
   return (
     <div
@@ -977,8 +1103,8 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
       }}
       onClick={() => session && onOpen(session.id)}
     >
-      <span className="task-swatch" data-testid="task-swatch" />
-      <span className="agent-mark" title={AGENT_LABEL[task.agent] ?? task.agent}><AgentIcon agent={task.agent} /></span>
+      <span className={`row-glyph g-${glyph}`} data-testid="row-glyph" data-glyph={glyph} />
+      {inPane && <span className="task-swatch" data-testid="task-swatch" />}
       <EditableTitle className="task-title" title={task.title} onSave={onRename} editing={editing} onEditingChange={setEditing} />
       {paneMark && <span className="pane-mark" data-testid="pane-mark">{paneMark}</span>}
       {!!session?.queued && status !== 'exited' && (
@@ -995,6 +1121,9 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
           }}
         >恢复</button>
       ) : status === 'exited' ? (
+        <>
+        {/* The process ending does not settle the result: 待验收 stays until it is approved. */}
+        {task.phase === 'review' && <span className="status st-review" data-testid="status">待验收</span>}
         <button
           className="resume-chip"
           data-testid="task-resume"
@@ -1004,6 +1133,7 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
             onResume();
           }}
         >续接</button>
+        </>
       ) : session?.limit ? (
         <span className="status st-needs_you" data-testid="status">额度用完</span>
       ) : task.phase === 'review' ? (
@@ -1039,6 +1169,20 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
           </button>
         </span>
       )}
+      <span className="agent-mark" title={AGENT_LABEL[task.agent] ?? task.agent}><AgentIcon agent={task.agent} /></span>
     </div>
   );
+}
+
+// The state glyph at the left edge of a row, so a column of tasks can be scanned without reading the status text.
+type RowGlyph = 'archived' | 'exited' | 'needs' | 'review' | 'approved' | 'working' | 'idle';
+function rowGlyph(task: Task, session?: SessionInfo): RowGlyph {
+  if (task.phase === 'archived') return 'archived';
+  if (!session || session.status === 'exited') return task.phase === 'review' ? 'review' : 'exited';
+  if (session.limit) return 'needs';
+  if (task.phase === 'review') return 'review';
+  if (task.phase === 'approved') return 'approved';
+  if (session.status === 'needs_you') return 'needs';
+  if (session.status === 'working') return 'working';
+  return 'idle';
 }

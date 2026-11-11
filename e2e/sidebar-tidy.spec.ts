@@ -66,9 +66,10 @@ test('rows: running, approved, stopped; archive at the bottom; count only when c
   await row(page, busy.session.id).getByTestId('task-unarchive').click();
   await expect(titles).toHaveText(['后建的', '已通过的', '还在跑的']);
 
-  // 后建的 finished its turn (待验收), so nobody is waiting: the collapsed head shows the count.
+  // 后建的 finished its turn: the collapsed head says 1 待验收 instead of the plain count.
   await group(page, project.id).getByTestId('project-toggle').click();
-  await expect(group(page, project.id).locator('.group-count')).toHaveText('3');
+  await expect(group(page, project.id).getByTestId('group-review')).toHaveText('1 待验收');
+  await expect(group(page, project.id).locator('.group-count')).toHaveCount(0);
 });
 
 test('sidebar width drags, clamps, persists and resets', async ({ page, request }) => {

@@ -2,10 +2,11 @@
 
 export type AgentKind = 'claude' | 'codex' | 'agy' | 'fake';
 
-// starting: spawned, no hook yet. working: a turn is running.
+// starting: spawned, no hook yet. idle: the CLI reported SessionStart and sits at an empty prompt (就绪), nothing to look at.
+// working: a turn is running.
 // needs_you: stopped and waiting for the user (turn finished, permission prompt, Ctrl+C, startup dialog).
 // exited: the PTY process is gone.
-export type SessionStatus = 'starting' | 'working' | 'needs_you' | 'exited';
+export type SessionStatus = 'starting' | 'idle' | 'working' | 'needs_you' | 'exited';
 
 export interface Project {
   id: string;
@@ -72,12 +73,19 @@ export interface SessionInfo {
   limit?: { message: string; resetsAt: number | null; at: number };
 }
 
+// Workbench-wide settings, stored in the state file.
+export interface Settings {
+  aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
+}
+export const DEFAULT_SETTINGS: Settings = { aiTitles: false };
+
 export interface Snapshot {
   projects: Project[];
   tasks: Task[];
   sessions: SessionInfo[];
   cards: Card[];
   agents: AgentKind[]; // agents that can be launched on this machine
+  settings: Settings;
 }
 
 // Nine muted colors that stay distinguishable on a dark background.
@@ -297,6 +305,7 @@ export type ServerMsg =
   | { t: 'task-removed'; id: string } // its cards are gone too
   | { t: 'project-removed'; id: string } // sent after a task-removed for each of its tasks
   | { t: 'card'; card: Card }
+  | { t: 'settings'; settings: Settings }
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
   | { t: 'out'; id: string; d: string };

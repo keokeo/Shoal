@@ -225,7 +225,7 @@ test.describe('待验收闭环', () => {
     // No conversation to reopen -> 400, nothing spawned.
     const { task: t2, session: e1 } = await createFakeTask(request, project.id, '没说过话');
     await row(page, e1.id).click();
-    await expectStatus(page, e1.id, 'needs_you');
+    await expectStatus(page, e1.id, 'idle');
     await page.keyboard.press('Control+C');
     await page.keyboard.press('Control+C');
     await expectStatus(page, e1.id, 'exited');

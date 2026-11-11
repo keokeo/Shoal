@@ -116,7 +116,7 @@ export interface DeliveryState {
 
 // Whether the head of a session's queue may be pasted now.
 export function deliverable(s: DeliveryState, now: number): boolean {
-  return s.status === 'needs_you' && now - s.statusSince >= SETTLE_MS && !s.permBlocked
+  return (s.status === 'needs_you' || s.status === 'idle') && now - s.statusSince >= SETTLE_MS && !s.permBlocked
     && now - s.lastInputAt >= TYPING_QUIET_MS && now - s.lastDeliveryAt >= DELIVERY_GAP_MS;
 }
 

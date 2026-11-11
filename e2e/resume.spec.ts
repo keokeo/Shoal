@@ -45,7 +45,7 @@ test('退出的任务：续接上次会话、新开会话，留在原窗格，�
   expect(native1).toBe(`fake-${s1.id}`);
 
   // Dual layout, the task in the right pane.
-  await page.getByTestId('layout-toggle').click();
+  await page.getByTestId('layout-2').click();
   await pane(page, 0).click();
   await row(page, other.id).click();
   await pane(page, 1).click();
@@ -59,7 +59,8 @@ test('退出的任务：续接上次会话、新开会话，留在原窗格，�
   await page.keyboard.type('exit 0\r');
   await expectStatus(page, s1.id, 'exited');
   await expect(row(page, s1.id).getByTestId('task-resume')).toBeVisible();
-  await expect(row(page, s1.id).getByTestId('status')).toHaveCount(0);
+  // The prompt's hook may be lost in the exit, leaving it 待验收; any other status is gone.
+  await expect(row(page, s1.id).getByTestId('status').filter({ hasNotText: '待验收' })).toHaveCount(0);
   await expect(row(page, s1.id).getByTestId('agent-icon')).toHaveCSS('opacity', '1');
   await expect(pane(page, 1).getByTestId('pane-exited')).toBeVisible();
   await expect(pane(page, 1).getByTestId('pane-resume')).toBeVisible();
@@ -70,7 +71,7 @@ test('退出的任务：续接上次会话、新开会话，留在原窗格，�
   const s2 = await sessionOf(page, task.id, s1.id);
   await expect(pane(page, 1)).toHaveAttribute('data-session-id', s2);
   await expect(pane(page, 0)).toHaveAttribute('data-session-id', other.id);
-  await expectStatus(page, s2, 'needs_you');
+  await expectStatus(page, s2, 'idle');
   await expect.poll(() => termText(page, s2)).toContain(`RESUMED ${native1}`);
   await expect(pane(page, 1).getByTestId('pane-exited')).toHaveCount(0);
   let st = await state(request);
@@ -88,7 +89,7 @@ test('退出的任务：续接上次会话、新开会话，留在原窗格，�
   await pane(page, 1).getByTestId('pane-fresh').click();
   const s3 = await sessionOf(page, task.id, s2);
   await expect(pane(page, 1)).toHaveAttribute('data-session-id', s3);
-  await expectStatus(page, s3, 'needs_you');
+  await expectStatus(page, s3, 'idle');
   await expect.poll(() => termText(page, s3)).toContain('FAKE AGENT');
   expect(await termText(page, s3)).not.toContain('RESUMED');
   st = await state(request);
@@ -103,7 +104,7 @@ test('没有对话记录的会话：只提供新开会话，行内续接先询�
   const project = await createProject(request, token('fresh'));
   const { task, session: s1 } = await createFakeTask(request, project.id, '没说过话');
   await page.goto('/');
-  await expectStatus(page, s1.id, 'needs_you');
+  await expectStatus(page, s1.id, 'idle');
   await row(page, s1.id).click();
   // Double Ctrl+C quits the fake CLI without any prompt.
   await page.keyboard.press('Control+C');
@@ -144,7 +145,7 @@ test('没有对话记录的会话：只提供新开会话，行内续接先询�
   await taskRow(page, task.id).getByTestId('task-resume').click();
   expect(await accepted).toBe(confirmText('没说过话'));
   const s2 = await sessionOf(page, task.id, s1.id);
-  await expectStatus(page, s2, 'needs_you');
+  await expectStatus(page, s2, 'idle');
   await expect.poll(() => termText(page, s2)).toContain('FAKE AGENT');
   expect(await termText(page, s2)).not.toContain('RESUMED');
   await expect(page.getByTestId('notice')).toHaveCount(0);
@@ -181,7 +182,7 @@ test('在 CLI 里 /resume 切换过对话：续接打开切换后的那段，不
 
   await taskRow(page, task.id).getByTestId('task-resume').click();
   const s2 = await sessionOf(page, task.id, s1.id);
-  await expectStatus(page, s2, 'needs_you');
+  await expectStatus(page, s2, 'idle');
   await expect.poll(() => termText(page, s2)).toContain(`RESUMED ${other}`);
   expect((await state(request)).sessions.find((s) => s.id === s2)?.nativeSessionId).toBe(other);
   expect(dialogs).toBe(0);

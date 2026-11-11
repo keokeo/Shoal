@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cleanTitle, titleFromPrompt } from './titles.ts';
+import { cleanTitle, titleFromPrompt, titleFromReply, titlePrompt, TITLE_PROMPT_HEAD } from './titles.ts';
 
 describe('titleFromPrompt', () => {
   it('uses the first non-empty line with whitespace collapsed', () => {
@@ -33,5 +33,43 @@ describe('cleanTitle', () => {
     expect(cleanTitle('[Image #1] [Image #2] [I…')).toBe('[Image #1] [Image #2] [I…');
     expect(cleanTitle('C:\Users\Administrat…')).toBe('C:\Users\Administrat…');
     expect(cleanTitle('改 a/b 的比例')).toBe('改 a/b 的比例');
+  });
+});
+
+describe('titlePrompt', () => {
+  it('starts with the head and caps the requirement at 2000 characters', () => {
+    const p = titlePrompt('a'.repeat(3000));
+    expect(p.startsWith(TITLE_PROMPT_HEAD)).toBe(true);
+    expect(p.split('任务需求：\n')[1]).toBe('a'.repeat(2000));
+  });
+});
+
+describe('titleFromReply', () => {
+  it('takes a plain line', () => {
+    expect(titleFromReply('修复登录页崩溃')).toBe('修复登录页崩溃');
+  });
+  it('strips quotes, brackets and trailing full stops', () => {
+    expect(titleFromReply('"Fix login crash."')).toBe('Fix login crash');
+    expect(titleFromReply('「修复登录页」')).toBe('修复登录页');
+    expect(titleFromReply('**《重构路由》**。')).toBe('重构路由');
+    expect(titleFromReply('`add tests`')).toBe('add tests');
+  });
+  it('strips title prefixes and heading or list markers', () => {
+    expect(titleFromReply('标题：修复登录')).toBe('修复登录');
+    expect(titleFromReply('标题: 修复登录')).toBe('修复登录');
+    expect(titleFromReply('TITLE: Fix login')).toBe('Fix login');
+    expect(titleFromReply('# 修复登录')).toBe('修复登录');
+    expect(titleFromReply('- 修复登录')).toBe('修复登录');
+  });
+  it('uses the first non-empty line only', () => {
+    expect(titleFromReply('\n\n  修复登录  \n\n这是解释')).toBe('修复登录');
+  });
+  it('cuts over-long replies like titleFromPrompt', () => {
+    expect(titleFromReply('中'.repeat(30))).toBe('中'.repeat(24) + '…');
+  });
+  it('returns an empty string when nothing is left', () => {
+    expect(titleFromReply('')).toBe('');
+    expect(titleFromReply('  \n \t ')).toBe('');
+    expect(titleFromReply('""')).toBe('');
   });
 });

@@ -33,7 +33,7 @@ test('project labels, 左/右 marks, and drag a task onto a pane', async ({ page
   await expect(row(page, a1.id)).not.toHaveAttribute('draggable', 'true');
 
   // Dual: A on the left, B on the right.
-  await page.getByTestId('layout-toggle').click();
+  await page.getByTestId('layout-2').click();
   await pane(page, 1).click();
   await row(page, b1.id).click();
   await expect(pane(page, 0)).toHaveAttribute('data-session-id', a1.id);
@@ -75,7 +75,7 @@ test('project labels, 左/右 marks, and drag a task onto a pane', async ({ page
   await expect(pane(page, 1)).toHaveAttribute('data-session-id', before!);
 
   // Back to a single pane: marks disappear.
-  await page.getByTestId('layout-toggle').click();
+  await page.getByTestId('layout-1').click();
   await expect(mark).toHaveCount(0);
   for (const t of [ta1, tb1, tb2]) await request.delete(`/api/tasks/${t.task.id}`);
 });

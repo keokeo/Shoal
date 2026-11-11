@@ -7,13 +7,14 @@ import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
   AgentKind, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, Project,
-  RenameTaskBody, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
+  RenameTaskBody, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
 } from '../shared/protocol.ts';
 import { canResume, feedbackPrompt, forwardText } from '../shared/protocol.ts';
 import { clipboardFiles } from './clipboard.ts';
+import { autoArchiveMs, staleApproved } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
 import { availableAgents, claudeResumeId, ROOT } from './agents.ts';
-import { fallbackCard, generateCard, generatorPrompt, handoffPrompt } from './handoff.ts';
+import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
 import { detectLimit } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
@@ -22,7 +23,7 @@ import type { SessionManager } from './sessions.ts';
 import { pickColor } from './store.ts';
 import type { Store } from './store.ts';
 import type { Usage } from './usage.ts';
-import { titleFromPrompt } from './titles.ts';
+import { titleFromPrompt, titleFromReply, titlePrompt } from './titles.ts';
 
 const MAX_BODY = 1024 * 1024;
 const DIST = path.join(ROOT, 'web', 'dist');
@@ -101,7 +102,7 @@ export function createApp(cfg: AppConfig) {
   if (process.env.WORKBENCH_DEV === '1') for (const o of ['http://127.0.0.1:5173', 'http://localhost:5173']) allowed.add(o);
 
   const snapshot = (): Snapshot => ({
-    projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(),
+    projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
   });
 
   const clients = new Set<WebSocket>();
@@ -150,7 +151,8 @@ export function createApp(cfg: AppConfig) {
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     let title = typeof body.title === 'string' ? body.title.trim() : '';
     let titleAuto = false;
-    if (!title) title = titleFromPrompt(prompt);
+    let fromPrompt = false;
+    if (!title) { title = titleFromPrompt(prompt); fromPrompt = !!title; }
     if (!title) {
       const used = new Set(store.tasks().filter(t => t.projectId === project.id).map(t => t.title));
       let n = 1;
@@ -178,6 +180,7 @@ export function createApp(cfg: AppConfig) {
     store.saveSession(session);
     broadcast({ t: 'task', task });
     broadcast({ t: 'session', session });
+    if (fromPrompt) aiRetitle(task.id, title, prompt);
     return { task, session };
   }
 
@@ -200,6 +203,17 @@ export function createApp(cfg: AppConfig) {
     broadcast({ t: 'task', task: next });
     return next;
   }
+
+  // Approved tasks left alone for days, with no running session, move to 已归档 (nothing to kill).
+  const archiveMs = autoArchiveMs(process.env.WORKBENCH_AUTO_ARCHIVE_DAYS);
+  function autoArchive() {
+    if (!archiveMs) return;
+    const live = new Set(sessions.list().filter(s => s.status !== 'exited').map(s => s.id));
+    for (const t of staleApproved(store.tasks(), live, Date.now(), archiveMs)) setPhase(t, 'archived');
+  }
+  autoArchive();
+  const archiveTimer = setInterval(autoArchive, 3600_000);
+  archiveTimer.unref();
 
   // Spawns a session for the task and makes it the current one; the old session is killed and forgotten so a task never piles up dead ones.
   function replaceSession(
@@ -389,6 +403,26 @@ export function createApp(cfg: AppConfig) {
     setPhase(task, 'review');
   }
 
+  // The first-line title is already showing; a short headless call of the task's agent writes a better one.
+  // Applied only if the title is still the one we set (the user has not renamed the task meanwhile).
+  function aiRetitle(taskId: string, shown: string, text: string): void {
+    if (!store.settings().aiTitles) return;
+    const task = store.getTask(taskId);
+    const project = task ? store.getProject(task.projectId) : undefined;
+    if (!task || !project) return;
+    void runHeadless(task.agent, titlePrompt(text), { cwd: project.path, stateDir: cfg.stateDir, timeoutMs: 60_000, what: '生成标题' })
+      .then(out => {
+        const title = out ? titleFromReply(out) : '';
+        if (!title) return;
+        const cur = store.getTask(taskId);
+        if (!cur || cur.title !== shown || title === shown) return;
+        const next: Task = { ...cur, title, titleAuto: false };
+        store.updateTask(next);
+        broadcast({ t: 'task', task: next });
+      })
+      .catch(e => console.warn(`[titles] 应用标题失败：${(e as Error).message}`));
+  }
+
   // First usable prompt of an auto-titled task becomes its title.
   function autoRename(body: HookBody) {
     const p = (body.payload ?? {}) as Record<string, unknown>;
@@ -402,6 +436,7 @@ export function createApp(cfg: AppConfig) {
     const task: Task = { ...old, title, titleAuto: false };
     store.updateTask(task);
     broadcast({ t: 'task', task });
+    aiRetitle(task.id, title, text);
   }
 
   function listDirs(q: URLSearchParams): DirListing {
@@ -503,6 +538,13 @@ export function createApp(cfg: AppConfig) {
       return send(res, 200, cfg.usage.report(at('from'), at('to')));
     }
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
+    if (method === 'POST' && pathname === '/api/settings') {
+      if (body.aiTitles !== undefined && typeof body.aiTitles !== 'boolean') throw new HttpError(400, '设置值无效');
+      const settings: Settings = { ...store.settings(), ...(typeof body.aiTitles === 'boolean' ? { aiTitles: body.aiTitles } : {}) };
+      store.setSettings(settings);
+      broadcast({ t: 'settings', settings });
+      return send(res, 200, settings);
+    }
     if (method === 'POST' && pathname === '/api/projects') return send(res, 200, createProject(body));
     if (method === 'POST' && pathname === '/api/tasks') return send(res, 200, createTask(body));
     const r = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
@@ -595,6 +637,7 @@ export function createApp(cfg: AppConfig) {
     });
   });
 
+  server.on('close', () => clearInterval(archiveTimer));
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url ?? '/', 'http://x').pathname;

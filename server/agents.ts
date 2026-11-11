@@ -11,7 +11,9 @@ function shortPath(p: string): string {
   if (!p.includes(' ') || process.platform !== 'win32') return p;
   try {
     // Verbatim: Node would otherwise escape the quotes as \" and cmd reads them literally.
-    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true }).trim();
+    // execFileSync honours windowsVerbatimArguments (it is a spawnSync option) though its typings leave it out.
+    const opts = { encoding: 'utf8' as const, windowsHide: true, windowsVerbatimArguments: true };
+    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], opts).trim();
     return out && fs.existsSync(out) ? out : p;
   } catch {
     return p;

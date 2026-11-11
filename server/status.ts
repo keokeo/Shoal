@@ -20,6 +20,10 @@ export function reduceStatus(current: SessionStatus, ev: StatusEvent): SessionSt
       return 'exited';
     case 'hook':
       if (WORKING.has(ev.event)) return 'working';
+      // A fresh session reached its prompt: ready, but nothing is waiting on the user yet.
+      if (ev.event === 'SessionStart') return current === 'starting' ? 'idle' : current;
+      // Claude's "waiting for your input" reminder fires on an untouched session too; it does not make it need you.
+      if (ev.event === 'Notification' && current === 'idle') return current;
       if (NEEDS_YOU.has(ev.event)) return 'needs_you';
       return current;
     case 'input':

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
-use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, Url, UserAttentionType, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
@@ -29,6 +29,8 @@ static CONNECTING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 // PID of the server this shell started (0: none, or it was already running).
 static SERVER_PID: AtomicU32 = AtomicU32::new(0);
+// Sessions waiting for the user, as the page last put it in its title ("(3) Shoal").
+static WAITING: AtomicU32 = AtomicU32::new(0);
 
 fn port() -> u16 {
     std::env::var("WORKBENCH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47800)
@@ -249,6 +251,11 @@ fn open_external(app: &AppHandle, url: &Url) {
     }
 }
 
+// "(3) Shoal" -> 3; anything else -> 0.
+fn waiting_count(title: &str) -> u32 {
+    title.strip_prefix('(').and_then(|t| t.split_once(')')).and_then(|(n, _)| n.parse().ok()).unwrap_or(0)
+}
+
 fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let nav_app = app.clone();
     let popup_app = app.clone();
@@ -262,6 +269,8 @@ fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     }
     let w = builder
         .title("Shoal")
+        // The page is dark only; a light system title bar on top of it was the brightest thing on screen.
+        .theme(Some(tauri::Theme::Dark))
         .inner_size(1440.0, 900.0)
         .min_inner_size(800.0, 500.0)
         .visible(false)
@@ -278,6 +287,16 @@ fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
                 open_external(&nav_app, url);
             }
             ok
+        })
+        // The page puts the number of sessions waiting for the user in its title; mirror it on the window and flash the
+        // taskbar button when it goes up while the window is in the background (Windows stops the flash on focus).
+        .on_document_title_changed(|w, title| {
+            let _ = w.set_title(&title);
+            let n = waiting_count(&title);
+            let before = WAITING.swap(n, Ordering::SeqCst);
+            if n > before && !w.is_focused().unwrap_or(true) {
+                let _ = w.request_user_attention(Some(UserAttentionType::Informational));
+            }
         })
         .on_page_load(|w, payload| {
             if payload.event() == PageLoadEvent::Finished && payload.url().host_str() == Some(SPLASH_HOST) {

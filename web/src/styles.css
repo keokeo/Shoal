@@ -98,13 +98,18 @@ kbd {
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
 .layout-icon { display: inline-block; width: 0.8125rem; height: 0.625rem; margin-right: 0.375rem; vertical-align: -1px; border: 1.5px solid currentColor; border-radius: 0.125rem; }
 .layout-icon.l2 { background: linear-gradient(currentColor, currentColor) center / 1.5px 100% no-repeat; }
+.seg { display: inline-flex; padding: 0.125rem; gap: 0.125rem; border: 1px solid var(--line); border-radius: 0.4375rem; }
+.seg .seg-btn { border-color: transparent; padding: 0.125rem 0.5rem; color: var(--text-3); }
+.seg .seg-btn.on { background: var(--active); color: var(--text); }
 
 /* Sidebar */
 .sidebar { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--side); border-right: 1px solid var(--line); }
 .side-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; right: -0.25rem; width: 0.5rem; cursor: col-resize; touch-action: none; }
 .side-resizer:hover, .side-resizer:active { background: linear-gradient(var(--line-2), var(--line-2)) center / 2px 100% no-repeat; }
-.side-head { display: flex; align-items: center; gap: 0.125rem; padding: 0.5rem 0.5rem 0.375rem 1rem; }
-.side-title { margin-right: auto; color: var(--text-3); font-size: 0.75rem; font-weight: 600; }
+.side-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.125rem; padding: 0.5rem 0.5rem 0.375rem 0.625rem; }
+.side-head > button { white-space: nowrap; }
+.side-head .seg { padding: 0; margin-right: auto; }
+.side-head .seg .seg-btn { padding: 0 0.4375rem; font-size: 0.75rem; white-space: nowrap; }
 .side-list { flex: 1; overflow-y: auto; padding: 0 0.375rem 1rem; }
 .side-empty { padding: 0.75rem 0.625rem; color: var(--text-3); }
 
@@ -125,6 +130,8 @@ kbd {
 .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .group-count { margin-left: auto; color: var(--text-3); font-size: 0.75rem; }
 .group-needs { margin-left: auto; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--signal); background: var(--signal-bg); }
+.group-review { margin-left: auto; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
+.group-needs + .group-review { margin-left: 0.25rem; }
 .group-empty { padding: 0.25rem 0.5rem 0.375rem 1.75rem; color: var(--text-3); font-size: 0.75rem; }
 
 .quick { position: relative; }
@@ -148,7 +155,7 @@ kbd {
 /* Task rows */
 .task-row {
   --c: var(--text-3);
-  display: flex; align-items: center; gap: 0.5rem; height: 1.875rem; padding: 0 0.25rem 0 0.8125rem;
+  display: flex; align-items: center; gap: 0.5rem; height: 1.875rem; padding: 0 0.25rem 0 0.625rem;
   border-radius: 0.375rem; cursor: pointer; color: var(--text-2);
 }
 .task-row:hover { background: var(--hover); color: var(--text); }
@@ -156,8 +163,15 @@ kbd {
 .task-row.in-pane { background: color-mix(in srgb, var(--c) 9%, var(--side)); color: var(--text-2); }
 .task-row.in-pane.pane-focused { background: color-mix(in srgb, var(--c) 18%, var(--side)); color: var(--text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 30%, transparent); }
 .task-row.in-pane:hover { background: color-mix(in srgb, var(--c) 22%, var(--side)); }
-/* The icon keeps its brand colors (which CLI); the swatch beside it carries the task color (which task). */
+/* Row layout: state glyph at the left edge, then the task-color swatch (only on rows shown in a pane), title, status, and the agent icon last, in its brand colors. */
 .task-swatch { width: 0.1875rem; height: 0.875rem; flex: none; border-radius: 0.125rem; background: var(--c); }
+.row-glyph { flex: none; box-sizing: border-box; width: 0.5rem; height: 0.5rem; border-radius: 50%; }
+.row-glyph.g-needs { background: var(--signal); }
+.row-glyph.g-working { background: var(--work); animation: breathe 2.4s ease-in-out infinite; }
+.row-glyph.g-review { border: 1.5px solid var(--text-2); }
+.row-glyph.g-idle { border: 1.5px solid var(--line-2); }
+.row-glyph.g-approved { border-radius: 0; width: 0.5rem; height: 0.3125rem; border-left: 1.5px solid var(--text-3); border-bottom: 1.5px solid var(--text-3); transform: translateY(-1px) rotate(-45deg) scale(.9); }
+.row-glyph.g-exited, .row-glyph.g-archived { width: 0.25rem; height: 0.25rem; margin: 0 0.125rem; background: var(--text-3); }
 .agent-icon { width: 0.875rem; height: 0.875rem; flex: none; color: var(--text-2); }
 .agent-mark { display: flex; flex: none; }
 .menu button { color: var(--text); }
@@ -174,6 +188,9 @@ kbd {
 .task-row:hover > .queued-mark, .task-row:focus-within > .queued-mark { display: none; }
 .queued-mark { flex: none; font-size: 0.75rem; color: var(--text-3); }
 .task-row .remove:hover:not(:disabled) { color: var(--danger); background: rgba(224, 122, 115, .12); }
+/* 活跃 filter: the stopped tasks left out of a group. */
+.group-hidden { display: block; width: 100%; padding: 0.25rem 0.5rem 0.25rem 1.75rem; background: transparent; border: 0; text-align: left; color: var(--text-3); font-size: 0.75rem; }
+.group-hidden:hover:not(:disabled) { background: transparent; color: var(--text-2); }
 /* Quiet until the row is hovered: a column of outlined chips was the loudest thing in the sidebar. */
 .resume-chip {
   flex: none; height: 1.25rem; padding: 0 0.5rem; font-size: 0.75rem; line-height: 1.125rem;
@@ -188,6 +205,7 @@ kbd {
 .title-input:focus { border-color: var(--work); }
 
 .status { flex: none; font-size: 0.75rem; white-space: nowrap; color: var(--text-3); }
+.status.st-idle { color: var(--text-2); }
 .status.st-working { color: var(--work); animation: breathe 2.4s ease-in-out infinite; }
 .status.st-review { padding: 0 0.4375rem; border-radius: 999px; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
 .status.st-needs_you { padding: 0 0.4375rem; border-radius: 999px; color: var(--signal); background: var(--signal-bg); font-weight: 600; }
@@ -214,8 +232,10 @@ kbd {
 .pane.dual:not(.focused) .pane-header { background: color-mix(in srgb, var(--c) 9%, var(--surface)); border-bottom-color: var(--line); color: var(--text-3); }
 /* The pane that is not taking keystrokes steps back. */
 .pane-body { transition: opacity .18s ease-out; }
-.pane.dual:not(.focused) .pane-body { opacity: .5; }
-.pane.dual:not(.focused):hover .pane-body { opacity: .72; }
+.pane.dual:not(.focused) .pane-body { opacity: .85; }
+.pane.dual:not(.focused):hover .pane-body { opacity: .95; }
+/* ...and the one that is carries a bar in its task color, so focus does not rely on dimming alone. */
+.pane.dual.focused .pane-header { box-shadow: inset 0 2px 0 var(--c); }
 .pane-project {
   display: inline-flex; align-items: center; gap: 0.3125rem; flex: 0 1 auto; min-width: 0; max-width: 12rem; height: 1.375rem; padding: 0 0.5rem;
   background: var(--active); border: 1px solid var(--line); border-radius: 0.375rem; color: var(--text-2); font-size: 0.75rem; white-space: nowrap;
@@ -287,6 +307,16 @@ kbd {
   background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.625rem;
   box-shadow: 0 1.5rem 4rem rgba(0, 0, 0, .5);
 }
+/* Alt+K task search */
+.search-overlay { align-items: flex-start; padding-top: 14vh; }
+.search-modal { gap: 0.5rem; padding: 0.75rem; }
+.search-list { display: flex; flex-direction: column; max-height: 22rem; overflow-y: auto; }
+.search-item { display: flex; align-items: center; gap: 0.5rem; height: 1.875rem; flex: none; padding: 0 0.5rem; border-radius: 0.375rem; cursor: pointer; color: var(--text-2); }
+.search-item.on { background: var(--active); color: var(--text); }
+.search-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-project { max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: 0.75rem; }
+.search-state { flex: none; min-width: 3rem; text-align: right; color: var(--text-3); font-size: 0.75rem; }
+.search-empty { padding: 0.5rem; color: var(--text-3); }
 .modal h3 { margin: 0 0 0.125rem; font-size: 0.875rem; font-weight: 600; }
 .modal label { display: flex; flex-direction: column; gap: 0.375rem; color: var(--text-2); font-size: 0.75rem; }
 .opt { color: var(--text-3); font-weight: 400; margin-left: 0.25rem; }
@@ -298,6 +328,21 @@ kbd {
 .modal input:focus, .modal select:focus, .modal textarea:focus { border-color: var(--work); box-shadow: 0 0 0 0.1875rem rgba(144, 181, 220, .15); }
 .modal textarea { resize: vertical; }
 .form-error { color: var(--danger); }
+/* Settings dialog */
+.setting-row { position: relative; display: flex; align-items: center; gap: 0.5rem; }
+.modal label.check-row { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--text); font-size: 0.8125rem; cursor: pointer; }
+.modal .check-row input { width: auto; padding: 0; margin: 0; }
+.help-btn {
+  width: 1rem; height: 1rem; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.6875rem; line-height: 1; border-radius: 50%; background: none; border: 1px solid var(--line-2); color: var(--text-3); cursor: help;
+}
+.help-btn:hover, .help-btn:focus-visible { color: var(--text); border-color: var(--text-3); }
+.help-tip {
+  position: absolute; top: calc(100% + 0.375rem); left: 0; width: min(20rem, 100%); z-index: 5; padding: 0.625rem 0.75rem;
+  background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem; box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .5);
+  font-size: 0.75rem; line-height: 1.6; color: var(--text-2); white-space: pre-line; visibility: hidden; opacity: 0; pointer-events: none;
+}
+.help:hover .help-tip, .help-btn:focus-visible + .help-tip { visibility: visible; opacity: 1; }
 .actions { display: flex; align-items: center; justify-content: flex-end; gap: 0.5rem; margin-top: 0.25rem; }
 .actions-hint { margin-right: auto; color: var(--text-3); font-size: 0.75rem; }
 .path-row { display: flex; gap: 0.375rem; }

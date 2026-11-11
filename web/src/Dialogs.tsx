@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePrivacy } from './privacy.ts';
-import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, Project, SessionInfo, Task } from '../../shared/protocol.ts';
+import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
 import { AGENT_LABEL, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
 
 export async function post<T>(url: string, body: unknown): Promise<T> {
@@ -107,6 +107,58 @@ function Modal({ title, testId, onClose, onSubmit, children }: {
         {children}
       </div>
     </div>
+  );
+}
+
+const AI_TITLES_TIP = [
+  '开启后，任务的第一句需求发出时，工作台先用这句话的第一行当标题，同时在后台让这个任务所用的 CLI 以 headless 方式做一次短调用，写一个更短、更概括的标题，通常十几秒内换上。',
+  '· 会消耗该 agent 的少量额度：Claude 用 Haiku；Codex 和 Antigravity 用各自的默认模型、最低推理档。每个任务只调用一次。',
+  '· 这次调用不计入 Token 统计。',
+  '· 你自己填写或改过的标题不会被替换；生成失败或超过 60 秒时保留第一行标题。',
+  '· 只对开启之后发出第一句需求的任务生效，已有任务的标题不变。',
+  '默认关闭。',
+].join('\n');
+
+// Changes are saved at once; the checkbox follows the server's value (settings arrive over the WebSocket).
+export function SettingsDialog({ settings, onClose }: { settings: Settings; onClose(): void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const setAiTitles = async (next: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await post<Settings>('/api/settings', { aiTitles: next });
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="设置" testId="settings-dialog" onClose={onClose} onSubmit={() => {}}>
+      <div className="setting-row">
+        <label className="check-row">
+          <input
+            type="checkbox"
+            data-testid="setting-ai-titles"
+            checked={settings.aiTitles}
+            onChange={(e) => void setAiTitles(e.target.checked)}
+          />
+          用 AI 自动起任务标题
+        </label>
+        <span className="help">
+          <button type="button" className="help-btn" data-testid="setting-ai-titles-help" aria-label="说明" aria-describedby="tip-ai-titles">?</button>
+          <span role="tooltip" id="tip-ai-titles" className="help-tip" data-testid="setting-ai-titles-tip">{AI_TITLES_TIP}</span>
+        </span>
+      </div>
+      {error && <div className="form-error" data-testid="settings-error">{error}</div>}
+      <div className="actions">
+        <button type="button" data-testid="settings-close" onClick={onClose}>关闭</button>
+      </div>
+    </Modal>
   );
 }
 

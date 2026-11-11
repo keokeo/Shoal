@@ -150,7 +150,7 @@ test('服务被强杀重启后：项目和任务还在，会话显示已退出�
     await row(page, a.session.id).getByTestId('task-resume').click();
     let resumedA = '';
     await expect.poll(async () => (resumedA = (await state(api)).tasks.find(t => t.title === '活着的任务')?.sessionId ?? '')).not.toBe(a.session.id);
-    await expectStatus(page, resumedA, 'needs_you');
+    await expectStatus(page, resumedA, 'idle'); // reopened at an empty prompt: 就绪
     await expect.poll(() => termText(page, resumedA)).toContain(`RESUMED ${nativeA}`);
     expect((await state(api)).sessions.find(s => s.id === resumedA)?.nativeSessionId).toBe(nativeA);
     const noConv = await api.post(`/api/tasks/${b.task.id}/resume`, { data: { cols: 100, rows: 30 } });

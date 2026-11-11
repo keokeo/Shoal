@@ -1,6 +1,6 @@
 import fs from 'node:fs';
-import type { Card, Project, SessionInfo, Task } from '../shared/protocol.ts';
-import { CARDS_PER_TASK, TASK_COLORS } from '../shared/protocol.ts';
+import type { Card, Project, SessionInfo, Settings, Task } from '../shared/protocol.ts';
+import { CARDS_PER_TASK, DEFAULT_SETTINGS, TASK_COLORS } from '../shared/protocol.ts';
 import { cleanTitle } from './titles.ts';
 
 // Pre-muted palette; tasks stored with these are migrated to the TASK_COLORS entry at the same index.
@@ -14,6 +14,8 @@ export interface Store {
   tasks(): Task[];
   sessions(): SessionInfo[];
   cards(): Card[];
+  settings(): Settings;
+  setSettings(s: Settings): void;
   getProject(id: string): Project | undefined;
   getTask(id: string): Task | undefined;
   addProject(p: Project): void;
@@ -32,6 +34,7 @@ interface StateFile {
   tasks: Task[];
   sessions: SessionInfo[];
   cards?: Card[]; // missing in files saved before M2
+  settings?: Settings; // missing in older files
 }
 
 function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): Store {
@@ -39,7 +42,11 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
   const tasks = new Map<string, Task>((init?.tasks ?? []).map(t => [t.id, t]));
   const sessions = new Map<string, SessionInfo>((init?.sessions ?? []).map(s => [s.id, s]));
   const cards = new Map<string, Card>((init?.cards ?? []).map(c => [c.id, c]));
+  let settings: Settings = { ...DEFAULT_SETTINGS };
+  if (typeof init?.settings?.aiTitles === 'boolean') settings.aiTitles = init.settings.aiTitles;
   const store: Store = {
+    settings: () => ({ ...settings }),
+    setSettings: s => { settings = { ...s }; onChange(store); },
     projects: () => [...projects.values()],
     tasks: () => [...tasks.values()],
     sessions: () => [...sessions.values()],
@@ -133,7 +140,7 @@ export function createFileStore(file: string): Store {
       : { ...s, status: 'exited', exitCode: null, statusSince: Date.now() }); // queues do not survive a restart
   }
   const flush = (store: Store) => {
-    const data: StateFile = { version: 1, projects: store.projects(), tasks: store.tasks(), sessions: store.sessions(), cards: store.cards() };
+    const data: StateFile = { version: 1, projects: store.projects(), tasks: store.tasks(), sessions: store.sessions(), cards: store.cards(), settings: store.settings() };
     const tmp = `${file}.tmp`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(data, null, 2));

@@ -20,3 +20,33 @@ export function cleanTitle(title: string): string {
   const s = title.replace(NOISE, ' ').replace(/\[[^\]]*…$/, '').replace(/\s+/g, ' ').trim();
   return s && s !== '…' ? s : title;
 }
+
+export const TITLE_PROMPT_HEAD = '给下面这个编程任务起一个标题。';
+
+// Prompt for the headless title call; the requirement is capped at 2000 characters.
+export function titlePrompt(text: string): string {
+  const capped = text.trim().slice(0, 2000);
+  return `${TITLE_PROMPT_HEAD}只输出标题本身：一行，不超过 16 个汉字（英文不超过 8 个词），用需求所用的语言，不加引号、句号、前缀和任何解释，不要使用工具。
+
+任务需求：
+${capped}`;
+}
+
+const WRAPS: [string, string][] = [['"', '"'], ["'", "'"], ['“', '”'], ['「', '」'], ['《', '》'], ['`', '`'], ['**', '**'], ['(', ')'], ['[', ']'], ['（', '）'], ['【', '】']];
+
+// The title out of a model's reply; '' if nothing usable.
+export function titleFromReply(out: string): string {
+  let s = out.split(/\r\n|\r|\n/).map(l => l.trim()).find(l => l) ?? '';
+  s = s.replace(/^(?:#+|[-*])\s+/, '').replace(/^(?:标题\s*[：:]|title\s*:)\s*/i, '').trim();
+  for (let again = true; again;) {
+    again = false;
+    s = s.replace(/[。.]$/, '');
+    for (const [a, b] of WRAPS) {
+      if (s.length >= a.length + b.length && s.startsWith(a) && s.endsWith(b)) { s = s.slice(a.length, s.length - b.length).trim(); again = true; }
+    }
+  }
+  s = s.replace(/[。.]$/, '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  const cps = [...s];
+  return cps.length > MAX_TITLE ? cps.slice(0, MAX_TITLE).join('') + '…' : s;
+}
