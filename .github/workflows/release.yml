@@ -1,8 +1,7 @@
-# Builds the self-contained Windows desktop installer and attaches it to a draft GitHub Release.
-# Every push to main (except docs-only changes) rebuilds the draft for the current version, replacing its installer;
+# Builds the self-contained Windows desktop installer and publishes it as a GitHub Release.
+# Every push to main (except docs-only changes) builds the current version and publishes it right away;
 # it also runs from the Actions tab, or on a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
-# The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it there to start a new release.
-# The draft stays private until someone presses Publish on the Releases page.
+# The release tag comes from desktop/src-tauri/tauri.conf.json ("version"); bump it (build-desktop.cmd does) to release again.
 # Once a version is published its installer is never replaced: builds for that version stop early until the version is bumped.
 name: Release desktop
 
@@ -86,7 +85,7 @@ jobs:
           tauriScript: npx tauri
           tagName: v__VERSION__
           releaseName: Shoal v__VERSION__
-          releaseDraft: true
+          releaseDraft: false
           uploadUpdaterJson: false
           releaseBody: |
             Windows x64 installer for the Shoal desktop app, a local workbench that runs Claude Code, Codex CLI and Antigravity CLI (`agy`) sessions side by side.
