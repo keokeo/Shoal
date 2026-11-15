@@ -18,7 +18,7 @@ const readStdin = () =>
   new Promise(resolve => {
     if (process.stdin.isTTY) return resolve('');
     let data = '';
-    const timer = setTimeout(() => resolve(data), 1500);
+    const timer = setTimeout(() => resolve(data), 800);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', chunk => { data += chunk; });
     process.stdin.on('end', () => { clearTimeout(timer); resolve(data); });
@@ -32,7 +32,7 @@ try {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
     body: JSON.stringify({ sessionId, agent, event, at: Date.now(), payload }),
-    signal: AbortSignal.timeout(2000),
+    signal: AbortSignal.timeout(450),
   });
 } catch (err) {
   process.stderr.write(`[workbench-hook] ${err?.message ?? err}\n`);

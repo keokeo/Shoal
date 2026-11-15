@@ -70,6 +70,27 @@ function finishTurn(text) {
   }
 }
 
+function splitShellArgs(raw) {
+  const out = [];
+  let cur = '';
+  let quote = '';
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+      else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (cur) { out.push(cur); cur = ''; }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 function submit() {
   const text = line;
   line = '';
@@ -154,6 +175,16 @@ function submit() {
     out('Allow? (y/n)');
     mode = 'ask';
     askText = text;
+  } else if (cmd === 'shoal') {
+    const cliArgs = splitShellArgs(text.trim().slice(5).trim());
+    const p = process.platform === 'win32'
+      ? spawn('cmd.exe', ['/d', '/c', 'shoal', ...cliArgs], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      : spawn('shoal', cliArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let captured = '';
+    p.stdout.on('data', d => { captured += d.toString('utf8'); });
+    p.stderr.on('data', d => { captured += d.toString('utf8'); });
+    p.on('error', e => finishTurn(`shoal(err): ${e.message}`));
+    p.on('exit', code => finishTurn(`shoal(${code ?? 1}): ${captured.trim()}`));
   } else {
     const ms = cmd === 'sleep' ? (Number(arg) || 0) * 1000 : 300;
     workTimer = setTimeout(() => finishTurn(text), ms);
@@ -211,13 +242,31 @@ function key(ch) {
 }
 
 let carry = '';
+let escTimer = null;
 let inPaste = false; // between bracketed-paste markers \n is a newline in the input, not a submit
 function feed(data) {
+  clearTimeout(escTimer);
   const s = carry + data;
   carry = '';
   for (let i = 0; i < s.length; ) {
     if (s[i] === '\x1b') {
-      if (i + 1 >= s.length) { carry = s.slice(i); break; }
+      if (i + 1 >= s.length) {
+        carry = s.slice(i);
+        escTimer = setTimeout(() => {
+          if (carry === '\x1b') {
+            carry = '';
+            if (mode !== 'idle') {
+              clearTimeout(workTimer);
+              queued = false;
+              mode = 'idle';
+              out('\r\nEscaped');
+              hook('Stop', { error: 'canceled' });
+              showPrompt();
+            }
+          }
+        }, 25);
+        break;
+      }
       if (s[i + 1] === '[') {
         // CSI: params then a final byte in 0x40-0x7e (covers paste markers, arrows, focus events)
         let j = i + 2;

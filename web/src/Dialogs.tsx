@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePrivacy } from './privacy.ts';
 import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
-import { AGENT_LABEL, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
+import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
 
 export async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -114,8 +114,8 @@ function Modal({ title, testId, onClose, onSubmit, children }: {
 }
 
 const AI_TITLES_TIP = [
-  '开启后，任务的第一句需求发出时，工作台先用这句话的第一行当标题，同时在后台让这个任务所用的 CLI 以 headless 方式做一次短调用，写一个更短、更概括的标题，通常十几秒内换上。',
-  '· 会消耗该 agent 的少量额度：Claude 用 Haiku；Codex 和 Antigravity 用各自的默认模型、最低推理档。每个任务只调用一次。',
+  '开启后，任务的第一句需求发出时，工作台先用这句话的第一行当标题，同时在后台让支持 headless 的 CLI 做一次短调用，写一个更短、更概括的标题，通常十几秒内换上。',
+  '· 会消耗少量额度：Claude 用 Haiku；Codex 用默认模型、最低推理档；Antigravity 为规避 headless 账号风控保持首行标题不额外调用。每个任务最多调用一次。',
   '· 这次调用不计入 Token 统计。',
   '· 你自己填写或改过的标题不会被替换；生成失败或超过 60 秒时保留第一行标题。',
   '· 只对开启之后发出第一句需求的任务生效，已有任务的标题不变。',
@@ -127,18 +127,20 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const setAiTitles = async (next: boolean) => {
+  const patchSettings = async (patch: Partial<Settings>) => {
     if (busy) return;
     setBusy(true);
     setError('');
     try {
-      await post<Settings>('/api/settings', { aiTitles: next });
+      await post<Settings>('/api/settings', patch);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
     }
   };
+
+  const activeAgyDesc = AGY_MODELS.find((m) => m.slug === (settings.agyModel ?? ''))?.desc;
 
   return (
     <Modal title="设置" testId="settings-dialog" onClose={onClose} onSubmit={() => {}}>
@@ -147,8 +149,8 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
           <input
             type="checkbox"
             data-testid="setting-ai-titles"
-            checked={settings.aiTitles}
-            onChange={(e) => void setAiTitles(e.target.checked)}
+            checked={settings.aiTitles}
+            onChange={(e) => void patchSettings({ aiTitles: e.target.checked })}
           />
           用 AI 自动起任务标题
         </label>
@@ -157,6 +159,20 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
           <span role="tooltip" id="tip-ai-titles" className="help-tip" data-testid="setting-ai-titles-tip">{AI_TITLES_TIP}</span>
         </span>
       </div>
+      <label>
+        <span>Antigravity 默认模型档位</span>
+        <select
+          data-testid="setting-agy-model"
+          value={settings.agyModel ?? ''}
+          disabled={busy}
+          onChange={(e) => void patchSettings({ agyModel: e.target.value })}
+        >
+          {AGY_MODELS.map((m) => (
+            <option key={m.slug} value={m.slug}>{m.label}</option>
+          ))}
+        </select>
+        {activeAgyDesc && <span className="field-hint">{activeAgyDesc}</span>}
+      </label>
       {error && <div className="form-error" data-testid="settings-error">{error}</div>}
       <div className="actions">
         <button type="button" data-testid="settings-close" onClick={onClose}>关闭</button>
@@ -211,11 +227,12 @@ export function ProjectDialog({ onClose, onCreated }: { onClose(): void; onCreat
   );
 }
 
-export function TaskDialog({ projects, agents, defaultProjectId, defaultAgent, size, onClose, onCreated }: {
+export function TaskDialog({ projects, agents, defaultProjectId, defaultAgent, defaultAgyModel, size, onClose, onCreated }: {
   projects: Project[];
   agents: AgentKind[];
   defaultProjectId: string;
   defaultAgent(projectId: string): AgentKind;
+  defaultAgyModel?: string;
   size: { cols: number; rows: number };
   onClose(): void;
   onCreated(r: { task: Task; session: SessionInfo }): void;
@@ -223,6 +240,7 @@ export function TaskDialog({ projects, agents, defaultProjectId, defaultAgent, s
   const [projectId, setProjectId] = useState(defaultProjectId);
   const [title, setTitle] = useState('');
   const [agent, setAgent] = useState<AgentKind>(() => defaultAgent(defaultProjectId));
+  const [agyModel, setAgyModel] = useState<string>(defaultAgyModel ?? '');
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -232,13 +250,22 @@ export function TaskDialog({ projects, agents, defaultProjectId, defaultAgent, s
     setBusy(true);
     setError('');
     try {
-      const body: CreateTaskBody = { projectId, title: title.trim() || undefined, agent, prompt: prompt.trim() || undefined, ...size };
+      const body: CreateTaskBody = {
+        projectId,
+        title: title.trim() || undefined,
+        agent,
+        ...(agent === 'agy' ? { model: agyModel } : {}),
+        prompt: prompt.trim() || undefined,
+        ...size,
+      };
       onCreated(await post<{ task: Task; session: SessionInfo }>('/api/tasks', body));
     } catch (e) {
       setError((e as Error).message);
       setBusy(false);
     }
   };
+
+  const agyDesc = agent === 'agy' ? AGY_MODELS.find((m) => m.slug === agyModel)?.desc : undefined;
 
   return (
     <Modal title="新建任务" onClose={onClose} onSubmit={submit}>
@@ -263,6 +290,16 @@ export function TaskDialog({ projects, agents, defaultProjectId, defaultAgent, s
           {agents.map((a) => <option key={a} value={a}>{a}</option>)}
         </select>
       </label>
+      {agent === 'agy' && (
+        <label><span>模型档位 <span className="opt">Antigravity</span></span>
+          <select data-testid="task-agy-model" value={agyModel} onChange={(e) => setAgyModel(e.target.value)}>
+            {AGY_MODELS.map((m) => (
+              <option key={m.slug} value={m.slug}>{m.label}</option>
+            ))}
+          </select>
+          {agyDesc && <span className="field-hint">{agyDesc}</span>}
+        </label>
+      )}
       <label><span>需求 <span className="opt">可选，也可以启动后在终端里输入</span></span>
         <textarea data-testid="task-prompt" rows={5} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
       </label>
@@ -329,7 +366,7 @@ export function ForwardDialog({ source, card, sourceAgent, projects, tasks, agen
   tasks: Task[];
   agents: AgentKind[];
   onClose(): void;
-  onForward(to: ForwardBody['to'], note: string): Promise<void>; // throws on failure
+  onForward(to: ForwardBody['to'], note: string, replyBack: boolean): Promise<void>; // throws on failure
 }) {
   const others = (projectId: string) =>
     tasks.filter((t) => t.projectId === projectId && t.id !== source.id && t.phase !== 'archived').sort((a, b) => a.createdAt - b.createdAt);
@@ -339,6 +376,7 @@ export function ForwardDialog({ source, card, sourceAgent, projects, tasks, agen
   });
   const [agent, setAgent] = useState<AgentKind>(() => (agents.includes(source.agent) ? source.agent : agents[0] ?? source.agent));
   const [note, setNote] = useState('');
+  const [replyBack, setReplyBack] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const isNew = target.startsWith('new:');
@@ -349,7 +387,7 @@ export function ForwardDialog({ source, card, sourceAgent, projects, tasks, agen
     setError('');
     try {
       const to: ForwardBody['to'] = isNew ? { projectId: target.slice(4), agent } : { taskId: target.slice(5) };
-      await onForward(to, note.trim());
+      await onForward(to, note.trim(), replyBack);
     } catch (e) {
       setError((e as Error).message);
       setBusy(false);
@@ -378,8 +416,17 @@ export function ForwardDialog({ source, card, sourceAgent, projects, tasks, agen
       <label><span>附言 <span className="opt">可选</span></span>
         <textarea data-testid="forward-note" rows={3} value={note} placeholder={FORWARD_NOTE} onChange={(e) => setNote(e.target.value)} />
       </label>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          data-testid="forward-reply-back"
+          checked={replyBack}
+          onChange={(e) => setReplyBack(e.target.checked)}
+        />
+        <span>对方本轮完成后，自动把结果传回「<span data-private="">{source.title}</span>」</span>
+      </label>
       <label>将发送的内容
-        <pre className="preview" data-testid="forward-preview" data-private="">{forwardText({ title: source.title, agent: sourceAgent }, card.body, note)}</pre>
+        <pre className="preview" data-testid="forward-preview" data-private="">{forwardText({ title: source.title, agent: sourceAgent }, card.body, note, { replyBack })}</pre>
       </label>
       {error && <div className="form-error" data-testid="forward-error">{error}</div>}
       <div className="actions">

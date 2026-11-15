@@ -333,3 +333,154 @@ test('safe Markdown preview (blocks XSS), inline image preview, and terminal fil
   await request.delete(`/api/tasks/${task.id}`);
   await request.delete(`/api/projects/${project.id}`);
 });
+
+test('massive changes virtualize smoothly, skip auto-diff, filter accurately, and avoid stale badge leaks across projects', async ({ page, request }) => {
+  const massiveDir = initGitProject('massive');
+  fs.writeFileSync(path.join(massiveDir, 'README.md'), '# Massive Repo\n');
+  execFileSync('git', ['add', '.'], { cwd: massiveDir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: massiveDir });
+  const bulkDir = path.join(massiveDir, 'bulk');
+  fs.mkdirSync(bulkDir, { recursive: true });
+  for (let i = 0; i < 600; i++) {
+    fs.writeFileSync(path.join(bulkDir, `file-${String(i).padStart(4, '0')}.ts`), `export const n = ${i};\n`);
+  }
+
+  const cleanDir = initGitProject('clean');
+  fs.writeFileSync(path.join(cleanDir, 'README.md'), '# Clean Repo\n');
+  execFileSync('git', ['add', '.'], { cwd: cleanDir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: cleanDir });
+
+  const massiveRes = await request.post('/api/projects', { data: { name: token('insp-massive'), path: massiveDir } });
+  expect(massiveRes.ok()).toBeTruthy();
+  const massiveProj = await massiveRes.json();
+
+  const cleanRes = await request.post('/api/projects', { data: { name: token('insp-clean'), path: cleanDir } });
+  expect(cleanRes.ok()).toBeTruthy();
+  const cleanProj = await cleanRes.json();
+
+  const { task, session } = await createFakeTask(request, massiveProj.id, '大仓库虚拟列表', '');
+
+  await page.goto('/');
+  await expectStatus(page, session.id, 'idle');
+  await row(page, session.id).click();
+  await pane(page, 0).locator('.xterm-helper-textarea').waitFor({ state: 'attached' });
+
+  const massiveGroup = page.locator(`[data-testid="project-group"][data-project-id="${massiveProj.id}"]`);
+  await expect(massiveGroup.getByTestId('project-dirty')).toHaveText('· 600');
+  await massiveGroup.getByTestId('project-branch').click();
+
+  const insp = page.getByTestId('inspector');
+  await expect(insp).toBeVisible();
+  await expect(insp.getByTestId('insp-dirty-count')).toHaveText('600');
+  await expect(insp.getByTestId('insp-change-list')).toHaveClass(/\bis-virtual\b/);
+
+  // Virtualization renders only visible slice + overscan, and >500 skips auto-picking a diff
+  const domCount = await insp.getByTestId('change-entry').count();
+  expect(domCount).toBeGreaterThan(0);
+  expect(domCount).toBeLessThan(80);
+  await expect(insp.getByTestId('insp-filepath')).toHaveCount(0);
+
+  await page.waitForTimeout(250);
+  const bodyBefore = (await pane(page, 0).locator('.pane-body').boundingBox())!;
+  const ptyBefore = await page.evaluate((id) => (window as any).__wbTermSize(id), session.id);
+  expect(ptyBefore).toBeTruthy();
+
+  // Filter locates deep file and opens diff cleanly
+  const filterInput = insp.getByTestId('change-filter-input');
+  await filterInput.fill('file-0599.ts');
+  await expect(insp.getByTestId('change-entry')).toHaveCount(1);
+  await insp.locator('[data-testid="change-entry"][data-path="bulk/file-0599.ts"]').click();
+  await expect(insp.getByTestId('insp-filepath')).toHaveText('bulk/file-0599.ts');
+  await expect(insp.locator('.cm-content')).toContainText('export const n = 599;');
+
+  // Switch rapidly to clean project -> badge clears and clean hint shows without leaking 600
+  const select = insp.getByTestId('insp-project-select');
+  await select.selectOption(cleanProj.id);
+  await expect(insp).toHaveAttribute('data-project-id', cleanProj.id);
+  await expect(insp.getByTestId('insp-dirty-count')).toHaveCount(0);
+  await insp.getByTestId('insp-tab-changes').click();
+  await expect(insp.getByTestId('insp-clean-hint')).toBeVisible();
+  await expect(insp.getByTestId('insp-dirty-count')).toHaveCount(0);
+
+  // Switch rapidly back to massive project -> dirty badge is 600 and clean hint never appears
+  await select.selectOption(massiveProj.id);
+  await expect(insp).toHaveAttribute('data-project-id', massiveProj.id);
+  await expect(insp.getByTestId('insp-clean-hint')).toHaveCount(0);
+  await expect(insp.getByTestId('insp-dirty-count')).toHaveText('600');
+  await expect(insp.getByTestId('insp-change-list')).toBeVisible();
+  await expect(insp.getByTestId('insp-clean-hint')).toHaveCount(0);
+
+  const bodyAfter = (await pane(page, 0).locator('.pane-body').boundingBox())!;
+  const ptyAfter = await page.evaluate((id) => (window as any).__wbTermSize(id), session.id);
+  expect(Math.abs(bodyAfter.width - bodyBefore.width)).toBeLessThan(0.5);
+  expect(Math.abs(bodyAfter.height - bodyBefore.height)).toBeLessThan(0.5);
+  expect(ptyAfter).toEqual(ptyBefore);
+
+  await request.delete(`/api/tasks/${task.id}`);
+  await request.delete(`/api/projects/${massiveProj.id}`);
+  await request.delete(`/api/projects/${cleanProj.id}`);
+});
+
+test('review popover and pane header rename work cleanly in inspect layout without focus loop or pageerror', async ({ page, request }) => {
+  const dir = initGitProject('review-focus');
+  fs.writeFileSync(path.join(dir, 'README.md'), '# Review Focus Test\n');
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+
+  const projRes = await request.post('/api/projects', { data: { name: token('insp-review-focus'), path: dir } });
+  expect(projRes.ok()).toBeTruthy();
+  const project = await projRes.json();
+
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  const { task, session } = await createFakeTask(request, project.id, '文件模式验收下拉测试', 'echo review-dropdown-ok');
+
+  await page.goto('/');
+  await expect(row(page, session.id).getByTestId('status')).toHaveText('待验收', { timeout: 15_000 });
+  await row(page, session.id).click();
+  await pane(page, 0).locator('.xterm-helper-textarea').waitFor({ state: 'attached' });
+
+  await page.getByTestId('layout-inspect').click();
+  const insp = page.getByTestId('inspector');
+  await expect(insp).toBeVisible();
+
+  const p0 = pane(page, 0);
+  await p0.getByTestId('review-toggle').click();
+  const pop = p0.getByTestId('review-popover');
+  await expect(pop).toBeVisible();
+  expect(pageErrors).toEqual([]);
+
+  await expect(pop.getByTestId('review-feedback')).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(pop.getByTestId('review-forward')).toBeFocused();
+  // Cross App's 1s `now` tick and ensure focus stays on the selected menu item rather than looping or jumping back.
+  await page.waitForTimeout(1200);
+  await expect(pop.getByTestId('review-forward')).toBeFocused();
+
+  await pop.getByTestId('review-expand').click();
+  await expect(pop.getByTestId('review-body')).toContainText('review-dropdown-ok');
+
+  await page.keyboard.press('Escape');
+  await expect(pop).toHaveCount(0);
+  await expect(p0.locator('.xterm-helper-textarea')).toBeFocused();
+
+  await p0.getByTestId('pane-rename').click();
+  const titleInput = p0.getByTestId('title-input');
+  await expect(titleInput).toBeVisible();
+  await expect(titleInput).toBeFocused();
+  await titleInput.fill('文件模式改名不丢焦');
+  await titleInput.press('Enter');
+  await expect(p0.getByTestId('pane-title')).toHaveText('文件模式改名不丢焦');
+
+  await insp.getByTestId('insp-tab-files').click();
+  await expect(p0.locator('.xterm-helper-textarea')).not.toBeFocused();
+  const bodyBox = (await p0.locator('.pane-body').boundingBox())!;
+  await page.mouse.click(bodyBox.x + 20, bodyBox.y + 20);
+  await expect(p0.locator('.xterm-helper-textarea')).toBeFocused();
+
+  expect(pageErrors).toEqual([]);
+
+  await request.delete(`/api/tasks/${task.id}`);
+  await request.delete(`/api/projects/${project.id}`);
+});

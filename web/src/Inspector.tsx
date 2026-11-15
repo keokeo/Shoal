@@ -83,11 +83,70 @@ function scorePath(candidate: string, query: string): number {
   return qi === lowQ.length ? 100 - lowC.length : -1;
 }
 
+const CHANGE_VIRTUAL_THRESHOLD = 100;
+const CHANGE_ROW_REM = 2.25;
+const CHANGE_OVERSCAN = 16;
+const TREE_VIRTUAL_THRESHOLD = 150;
+const TREE_ROW_REM = 1.5625;
+const TREE_OVERSCAN = 16;
+const AUTO_PICK_LIMIT = 500;
+
+interface VirtualSlice {
+  startIdx: number;
+  endIdx: number;
+  topPad: number;
+  bottomPad: number;
+}
+
+function computeVirtualSlice(total: number, scrollTop: number, height: number, rowRem: number, remPx: number, overscan: number): VirtualSlice {
+  const rowPx = rowRem * remPx;
+  const totalHeight = total * rowPx;
+  const clampedScroll = Math.min(scrollTop, Math.max(0, totalHeight - height));
+  const startIdx = Math.max(0, Math.floor(clampedScroll / rowPx) - overscan);
+  const visibleCount = Math.ceil(height / rowPx) + overscan * 2;
+  const endIdx = Math.min(total, startIdx + visibleCount);
+  return {
+    startIdx,
+    endIdx,
+    topPad: startIdx * rowPx,
+    bottomPad: Math.max(0, (total - endIdx) * rowPx),
+  };
+}
+
+function useVirtualContainer(ref: React.RefObject<HTMLDivElement | null>, enabled: boolean) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const [metrics, setMetrics] = useState({ height: 500, remPx: 16 });
+
+  useEffect(() => {
+    if (!enabled) return;
+    const el = ref.current;
+    if (!el) return;
+    const update = () => {
+      const remPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      const height = el.clientHeight || 500;
+      setMetrics((prev) => (prev.height === height && prev.remPx === remPx ? prev : { height, remPx }));
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    const mo = new MutationObserver(update);
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
+  }, [ref, enabled]);
+
+  return { scrollTop, setScrollTop, height: metrics.height, remPx: metrics.remPx };
+}
+
 export function Inspector({
   project, projects, git, watchRev, openRequest, onSelectProject, onClose, onNotice,
 }: InspectorProps) {
   const memRef = useRef<Map<string, ProjectViewMem>>(new Map());
   const rootRef = useRef<HTMLElement>(null);
+  const changeListRef = useRef<HTMLDivElement>(null);
+  const treeScrollRef = useRef<HTMLDivElement>(null);
 
   const [tab, setTab] = useState<InspectorTab>(() => (git && git.dirty > 0 ? 'changes' : 'files'));
   const [sideOpen, setSideOpen] = useState(true);
@@ -95,6 +154,11 @@ export function Inspector({
   // Changes tab state
   const [changes, setChanges] = useState<ChangedFile[]>([]);
   const [changesGit, setChangesGit] = useState<GitInfo | null>(null);
+  const [changesLoadedFor, setChangesLoadedFor] = useState<string>('');
+  const [changesError, setChangesError] = useState<string | null>(null);
+  const [changesTruncated, setChangesTruncated] = useState(false);
+  const [changesStale, setChangesStale] = useState(false);
+  const [changeFilter, setChangeFilter] = useState('');
   const [changePath, setChangePath] = useState<string | null>(null);
   const [changeMode, setChangeMode] = useState<'diff' | 'edit'>('diff');
   const [diffData, setDiffData] = useState<DiffPayload | null>(null);
@@ -130,43 +194,93 @@ export function Inspector({
   const activePath = tab === 'changes' ? changePath : filePath;
   const isEditingText = useMemo(() => {
     if (!activePath) return false;
-    if (tab === 'changes') return !!diffData && !diffData.binary && !diffData.tooLarge && diffData.status !== 'D';
+    if (tab === 'changes') return !!diffData && !diffData.binary && !diffData.tooLarge && !diffData.isDirectory && diffData.status !== 'D';
     return fileData?.kind === 'text';
   }, [activePath, tab, diffData, fileData]);
   const isDirty = isEditingText && draft !== savedText;
 
   const liveRef = useRef({ projectId, tab, activePath, isDirty, loadedMtime, changeMode, mdMode });
   liveRef.current = { projectId, tab, activePath, isDirty, loadedMtime, changeMode, mdMode };
+  const gitRef = useRef(git);
+  gitRef.current = git;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const openRequestRef = useRef(openRequest);
+  openRequestRef.current = openRequest;
+
+  const changesReqRef = useRef<{ seq: number; ctrl: AbortController | null }>({ seq: 0, ctrl: null });
+  const docReqSeqRef = useRef(0);
+  const lastChangesFetchedRef = useRef<{ pid: string; gitJson: string; at: number } | null>(null);
+  const changesRequestedForRef = useRef('');
+  const treeLoadedRootForRef = useRef('');
+  const treeStaleRef = useRef(false);
+  const initReqSeqRef = useRef(0);
+
+  useEffect(() => () => {
+    changesReqRef.current.ctrl?.abort();
+  }, []);
 
   const confirmDiscardDraft = useCallback((): boolean => {
     if (!liveRef.current.isDirty) return true;
     return confirm('当前打开的文件有未保存修改，确定放弃这些修改吗？');
   }, []);
 
-  // Fetch changes list for a project
-  const fetchChanges = useCallback(async (pid: string, autoPick = false) => {
+  // Fetch changes list for a project with single-flight abort & race protection
+  const fetchChanges = useCallback(async (pid: string, autoPick = false, force = false) => {
     if (!pid) return;
+    if (!force && lastChangesFetchedRef.current?.pid === pid) {
+      const sameRecentGit = JSON.stringify(gitRef.current ?? null) === lastChangesFetchedRef.current.gitJson;
+      if (sameRecentGit && Date.now() - lastChangesFetchedRef.current.at < 800) {
+        return;
+      }
+    }
+    changesRequestedForRef.current = pid;
+    setChangesStale(false);
+    setChangesError(null);
+
+    changesReqRef.current.ctrl?.abort();
+    const ctrl = new AbortController();
+    const seq = ++changesReqRef.current.seq;
+    changesReqRef.current.ctrl = ctrl;
+
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/changes`);
-      if (!res.ok) return;
+      const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/changes`, { signal: ctrl.signal });
+      if (seq !== changesReqRef.current.seq || liveRef.current.projectId !== pid) return;
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setChangesError(err.error ?? `读取改动失败 (${res.status})`);
+        return;
+      }
       const json = (await res.json()) as ProjectChanges;
-      if (liveRef.current.projectId !== pid) return;
+      if (seq !== changesReqRef.current.seq || liveRef.current.projectId !== pid) return;
+
+      lastChangesFetchedRef.current = { pid, gitJson: JSON.stringify(json.git), at: Date.now() };
       setChanges(json.files);
       setChangesGit(json.git);
+      setChangesTruncated(!!json.truncated);
+      setChangesLoadedFor(pid);
+      setChangesError(null);
       if (autoPick) {
         setChangePath((prev) => {
           if (prev && json.files.some((f) => f.path === prev)) return prev;
+          if (json.files.length > AUTO_PICK_LIMIT) return null;
           return json.files[0]?.path ?? null;
         });
       }
-    } catch {
-      // ignore transient network error
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return;
+      if (seq !== changesReqRef.current.seq || liveRef.current.projectId !== pid) return;
+      setChangesError((e as Error).message || '读取改动失败');
     }
   }, []);
 
   // Fetch one directory level for the file tree
   const fetchTreeDir = useCallback(async (pid: string, dirPosix: string) => {
     if (!pid) return;
+    if (dirPosix === '') {
+      treeLoadedRootForRef.current = pid;
+      treeStaleRef.current = false;
+    }
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/tree?path=${encodeURIComponent(dirPosix)}`);
       if (!res.ok) return;
@@ -181,16 +295,18 @@ export function Inspector({
   // Load diff payload for a changed file
   const loadDiffFile = useCallback(async (pid: string, relPath: string, silent = false) => {
     if (!pid || !relPath) return;
+    const seq = ++docReqSeqRef.current;
     if (!silent) setLoadingDoc(true);
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/diff?path=${encodeURIComponent(relPath)}`);
+      if (seq !== docReqSeqRef.current || liveRef.current.projectId !== pid) return;
       if (!res.ok) {
         const err = (await res.json().catch(() => ({}))) as { error?: string };
         if (!silent) onNotice(err.error ?? `读取对比失败 (${res.status})`);
         return;
       }
       const json = (await res.json()) as DiffPayload;
-      if (liveRef.current.projectId !== pid) return;
+      if (seq !== docReqSeqRef.current || liveRef.current.projectId !== pid) return;
       setDiffData(json);
       setSavedText(json.head);
       setDraft(json.head);
@@ -198,23 +314,25 @@ export function Inspector({
       setConflict(false);
       if (silent) setExternalRev((n) => n + 1);
     } finally {
-      if (!silent) setLoadingDoc(false);
+      if (!silent && seq === docReqSeqRef.current) setLoadingDoc(false);
     }
   }, [onNotice]);
 
   // Load file payload for the Files tab
   const loadTreeFile = useCallback(async (pid: string, relPath: string, silent = false) => {
     if (!pid || !relPath) return;
+    const seq = ++docReqSeqRef.current;
     if (!silent) setLoadingDoc(true);
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/file?path=${encodeURIComponent(relPath)}`);
+      if (seq !== docReqSeqRef.current || liveRef.current.projectId !== pid) return;
       if (!res.ok) {
         const err = (await res.json().catch(() => ({}))) as { error?: string };
         if (!silent) onNotice(err.error ?? `读取文件失败 (${res.status})`);
         return;
       }
       const json = (await res.json()) as FilePayload;
-      if (liveRef.current.projectId !== pid) return;
+      if (seq !== docReqSeqRef.current || liveRef.current.projectId !== pid) return;
       setFileData(json);
       const text = json.kind === 'text' ? (json.content ?? '') : '';
       setSavedText(text);
@@ -223,16 +341,25 @@ export function Inspector({
       setConflict(false);
       if (silent) setExternalRev((n) => n + 1);
     } finally {
-      if (!silent) setLoadingDoc(false);
+      if (!silent && seq === docReqSeqRef.current) setLoadingDoc(false);
     }
   }, [onNotice]);
 
-  // Initialize / restore state when switching projects
+  // Initialize / restore state when switching projects (lazy-loads only the active tab)
   const prevProjectRef = useRef<string>('');
   useEffect(() => {
     if (!projectId) {
       prevProjectRef.current = '';
+      changesReqRef.current.ctrl?.abort();
+      changesRequestedForRef.current = '';
+      treeLoadedRootForRef.current = '';
       setChanges([]);
+      setChangesGit(null);
+      setChangesLoadedFor('');
+      setChangesError(null);
+      setChangesTruncated(false);
+      setChangesStale(false);
+      setChangeFilter('');
       setChangePath(null);
       setDiffData(null);
       setTreeMap({});
@@ -245,11 +372,29 @@ export function Inspector({
     prevProjectRef.current = projectId;
 
     const saved = memRef.current.get(projectId);
-    const defaultTab: InspectorTab = saved ? saved.tab : (git && git.dirty > 0 ? 'changes' : 'files');
+    const req = openRequestRef.current;
+    const reqMatches = !!req && req.seq !== handledReqSeq.current && req.projectId === projectId;
+    initReqSeqRef.current = reqMatches ? req.seq : 0;
+
+    const curGit = gitRef.current;
+    const defaultTab: InspectorTab = reqMatches
+      ? req.tab
+      : saved
+        ? saved.tab
+        : (curGit && curGit.dirty > 0 ? 'changes' : 'files');
+
+    const initExpanded = saved?.expanded ?? new Set<string>();
     setTab(defaultTab);
     setChangePath(saved?.changeFile ?? null);
     setFilePath(saved?.treeFile ?? null);
-    setExpanded(saved?.expanded ?? new Set());
+    setExpanded(initExpanded);
+    setChanges([]);
+    setChangesGit(null);
+    setChangesLoadedFor('');
+    setChangesError(null);
+    setChangesTruncated(false);
+    setChangesStale(false);
+    setChangeFilter('');
     setDiffData(null);
     setFileData(null);
     setDraft('');
@@ -258,13 +403,35 @@ export function Inspector({
     setConflict(false);
     setTreeMap({});
     setFinderOpen(false);
+    setAllFiles([]);
+    if (changeListRef.current) changeListRef.current.scrollTop = 0;
+    if (treeScrollRef.current) treeScrollRef.current.scrollTop = 0;
 
-    void fetchChanges(projectId, !saved?.changeFile);
-    void fetchTreeDir(projectId, '');
-    if (saved?.expanded) {
-      for (const dir of saved.expanded) void fetchTreeDir(projectId, dir);
+    if (defaultTab === 'changes') {
+      treeLoadedRootForRef.current = '';
+      treeStaleRef.current = true;
+      const willAutoPick = !(reqMatches && req.filePath) && !saved?.changeFile;
+      void fetchChanges(projectId, willAutoPick, true);
+    } else {
+      changesRequestedForRef.current = '';
+      setChangesStale(true);
+      void fetchTreeDir(projectId, '');
+      for (const dir of initExpanded) void fetchTreeDir(projectId, dir);
     }
-  }, [projectId, git, fetchChanges, fetchTreeDir]);
+  }, [projectId, fetchChanges, fetchTreeDir]);
+
+  // Lazy-refresh target tab when switching between Changes and Files
+  useEffect(() => {
+    if (!projectId) return;
+    if (tab === 'changes') {
+      if (changesStale || (changesLoadedFor !== projectId && changesRequestedForRef.current !== projectId)) {
+        void fetchChanges(projectId, !changePath, true);
+      }
+    } else if (treeStaleRef.current || treeLoadedRootForRef.current !== projectId) {
+      void fetchTreeDir(projectId, '');
+      for (const d of expandedRef.current) void fetchTreeDir(projectId, d);
+    }
+  }, [tab, projectId, changesStale, changesLoadedFor, changePath, fetchChanges, fetchTreeDir]);
 
   // Persist current project's memory after initialization has run for projectId.
   useEffect(() => {
@@ -283,30 +450,37 @@ export function Inspector({
     if (!openRequest || openRequest.seq === handledReqSeq.current) return;
     if (openRequest.projectId !== projectId) return;
     handledReqSeq.current = openRequest.seq;
+    const sameCommitInit = initReqSeqRef.current === openRequest.seq;
+    initReqSeqRef.current = 0;
 
     setTab(openRequest.tab);
     if (openRequest.tab === 'changes') {
-      void fetchChanges(projectId, !openRequest.filePath);
+      if (!sameCommitInit) void fetchChanges(projectId, !openRequest.filePath, true);
       if (openRequest.filePath) {
         setChangePath(openRequest.filePath);
         setChangeMode(openRequest.line ? 'edit' : 'diff');
       }
-    } else if (openRequest.filePath) {
-      const rel = openRequest.filePath;
-      setFilePath(rel);
-      if (isMarkdownPath(rel) && openRequest.line) {
-        setMdMode('source');
-      } else if (isMarkdownPath(rel)) {
-        setMdMode('preview');
+    } else {
+      if (!sameCommitInit && (treeStaleRef.current || treeLoadedRootForRef.current !== projectId)) {
+        void fetchTreeDir(projectId, '');
       }
-      const dirs = ancestorDirs(rel);
-      if (dirs.length > 0) {
-        setExpanded((prev) => {
-          const next = new Set(prev);
-          for (const d of dirs) next.add(d);
-          return next;
-        });
-        for (const d of dirs) void fetchTreeDir(projectId, d);
+      if (openRequest.filePath) {
+        const rel = openRequest.filePath;
+        setFilePath(rel);
+        if (isMarkdownPath(rel) && openRequest.line) {
+          setMdMode('source');
+        } else if (isMarkdownPath(rel)) {
+          setMdMode('preview');
+        }
+        const dirs = ancestorDirs(rel);
+        if (dirs.length > 0) {
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            for (const d of dirs) next.add(d);
+            return next;
+          });
+          for (const d of dirs) void fetchTreeDir(projectId, d);
+        }
       }
     }
     if (openRequest.line) {
@@ -354,12 +528,17 @@ export function Inspector({
     }
   }, [loadDiffFile, loadTreeFile]);
 
-  // Refresh when watchRev bumps (WS git / task Stop events), window focuses, or periodic 2.5s poll while open
+  // Refresh active tab only when watchRev bumps (WS snapshot / review / active-project git), window focuses, or 2.5s active-file poll
   useEffect(() => {
-    if (!projectId) return;
-    void fetchChanges(projectId, false);
-    void fetchTreeDir(projectId, '');
-    for (const d of expanded) void fetchTreeDir(projectId, d);
+    if (!projectId || watchRev === 0) return;
+    if (liveRef.current.tab === 'changes') {
+      void fetchChanges(projectId, false, false);
+      treeStaleRef.current = true;
+    } else {
+      void fetchTreeDir(projectId, '');
+      for (const d of expandedRef.current) void fetchTreeDir(projectId, d);
+      setChangesStale(true);
+    }
     void checkExternalUpdate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [watchRev]);
@@ -367,7 +546,14 @@ export function Inspector({
   useEffect(() => {
     if (!projectId) return;
     const onFocus = () => {
-      void fetchChanges(projectId, false);
+      if (liveRef.current.tab === 'changes') {
+        void fetchChanges(projectId, false, false);
+        treeStaleRef.current = true;
+      } else {
+        void fetchTreeDir(projectId, '');
+        for (const d of expandedRef.current) void fetchTreeDir(projectId, d);
+        setChangesStale(true);
+      }
       void checkExternalUpdate();
     };
     window.addEventListener('focus', onFocus);
@@ -376,7 +562,7 @@ export function Inspector({
       window.removeEventListener('focus', onFocus);
       clearInterval(timer);
     };
-  }, [projectId, fetchChanges, checkExternalUpdate]);
+  }, [projectId, fetchChanges, fetchTreeDir, checkExternalUpdate]);
 
   // Save file (with optimistic mtime lock unless force=true)
   const saveCurrent = useCallback(async (force = false) => {
@@ -405,11 +591,14 @@ export function Inspector({
       setSavedText(draft);
       setLoadedMtime(json.mtimeMs);
       setConflict(false);
-      // Refresh git changes & diff base/head so diff view reflects saved file
-      void fetchChanges(projectId, false);
-      void fetchTreeDir(projectId, splitDirBase(activePath).dir);
+      // Refresh active tab & mark inactive tab stale
       if (tab === 'changes') {
+        void fetchChanges(projectId, false, true);
+        treeStaleRef.current = true;
         void loadDiffFile(projectId, activePath, true);
+      } else {
+        void fetchTreeDir(projectId, splitDirBase(activePath).dir);
+        setChangesStale(true);
       }
     } catch (e) {
       onNotice(`保存失败：${(e as Error).message}`);
@@ -443,8 +632,8 @@ export function Inspector({
         setSavedText('');
         setConflict(false);
       }
-      await fetchChanges(projectId, true);
-      void fetchTreeDir(projectId, '');
+      await fetchChanges(projectId, true, true);
+      treeStaleRef.current = true;
     } catch (e) {
       onNotice(`放弃改动失败：${(e as Error).message}`);
     }
@@ -547,23 +736,26 @@ export function Inspector({
   };
 
   const toggleDir = (dirPosix: string) => {
+    const willOpen = !expanded.has(dirPosix);
     setExpanded((prev) => {
       const next = new Set(prev);
-      if (next.has(dirPosix)) {
-        next.delete(dirPosix);
-      } else {
-        next.add(dirPosix);
-        if (projectId) void fetchTreeDir(projectId, dirPosix);
-      }
+      if (next.has(dirPosix)) next.delete(dirPosix);
+      else next.add(dirPosix);
       return next;
     });
+    if (willOpen && projectId) void fetchTreeDir(projectId, dirPosix);
   };
 
   const manualRefresh = () => {
     if (!projectId) return;
-    void fetchChanges(projectId, false);
-    void fetchTreeDir(projectId, '');
-    for (const d of expanded) void fetchTreeDir(projectId, d);
+    if (tab === 'changes') {
+      void fetchChanges(projectId, false, true);
+      treeStaleRef.current = true;
+    } else {
+      void fetchTreeDir(projectId, '');
+      for (const d of expanded) void fetchTreeDir(projectId, d);
+      setChangesStale(true);
+    }
     if (activePath && !isDirty) {
       if (tab === 'changes') void loadDiffFile(projectId, activePath, true);
       else void loadTreeFile(projectId, activePath, true);
@@ -572,50 +764,76 @@ export function Inspector({
     }
   };
 
-  const renderTreeNodes = (dirPosix: string, depth: number): React.ReactNode => {
-    const list = treeMap[dirPosix];
-    if (!list) {
-      return depth === 0 ? <div className="insp-empty-hint">读取目录中…</div> : null;
-    }
-    if (list.length === 0 && depth === 0) {
-      return <div className="insp-empty-hint">空目录</div>;
-    }
-    return list.map((entry) => {
-      const isOpen = entry.kind === 'dir' && expanded.has(entry.path);
-      const isSelected = entry.kind === 'file' && filePath === entry.path;
-      return (
-        <div key={entry.path}>
-          <button
-            type="button"
-            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${entry.ignored ? 'ignored' : ''}`}
-            style={{ paddingLeft: `${0.5 + depth * 0.8125}rem` }}
-            data-testid="tree-entry"
-            data-path={entry.path}
-            data-kind={entry.kind}
-            onClick={() => (entry.kind === 'dir' ? toggleDir(entry.path) : pickFileFromTreeOrFinder(entry.path))}
-          >
-            {entry.kind === 'dir' ? (
-              <svg className={`tree-chev ${isOpen ? 'open' : ''}`} viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M6 4l4 4-4 4" />
-              </svg>
-            ) : (
-              <span className="tree-file-dot" />
-            )}
-            <span className="tree-name" data-private="">{entry.name}</span>
-            {entry.gitStatus && (
-              <span className={`git-badge st-${entry.gitStatus === '?' ? 'U2' : entry.gitStatus}`} title={STATUS_TITLE[entry.gitStatus]}>
-                {entry.gitStatus}
-              </span>
-            )}
-          </button>
-          {isOpen && renderTreeNodes(entry.path, depth + 1)}
-        </div>
-      );
-    });
-  };
-
-  const dirtyCount = changes.length || git?.dirty || changesGit?.dirty || 0;
+  const isChangesReady = changesLoadedFor === projectId && !changesError;
+  const dirtyCount = isChangesReady && !changesStale
+    ? (changesGit?.dirty ?? changes.length)
+    : (git?.dirty ?? (isChangesReady ? (changesGit?.dirty ?? changes.length) : 0));
   const branchLabel = (git ?? changesGit)?.branch;
+
+  const filteredChanges = useMemo(() => {
+    const q = changeFilter.trim().toLowerCase();
+    if (!q) return changes;
+    return changes.filter((item) => item.path.toLowerCase().includes(q) || (item.origPath && item.origPath.toLowerCase().includes(q)));
+  }, [changes, changeFilter]);
+
+  const showChangeList = isChangesReady && !changesError && changesGit !== null && changes.length > 0;
+  const isVirtualChanges = showChangeList && filteredChanges.length > CHANGE_VIRTUAL_THRESHOLD;
+  const changeVirt = useVirtualContainer(changeListRef, tab === 'changes' && isVirtualChanges);
+  const { setScrollTop: setChangeScrollTop } = changeVirt;
+
+  useEffect(() => {
+    setChangeScrollTop(0);
+    if (changeListRef.current) changeListRef.current.scrollTop = 0;
+  }, [changeFilter, projectId, tab, setChangeScrollTop]);
+
+  const changeSlice = useMemo(
+    () => (isVirtualChanges
+      ? computeVirtualSlice(filteredChanges.length, changeVirt.scrollTop, changeVirt.height, CHANGE_ROW_REM, changeVirt.remPx, CHANGE_OVERSCAN)
+      : { startIdx: 0, endIdx: filteredChanges.length, topPad: 0, bottomPad: 0 }),
+    [isVirtualChanges, filteredChanges.length, changeVirt.scrollTop, changeVirt.height, changeVirt.remPx],
+  );
+  const visibleChanges = useMemo(
+    () => filteredChanges.slice(changeSlice.startIdx, changeSlice.endIdx),
+    [filteredChanges, changeSlice.startIdx, changeSlice.endIdx],
+  );
+
+  const flatTreeRows = useMemo(() => {
+    const out: Array<{ entry: TreeEntry; depth: number }> = [];
+    const walk = (dirPosix: string, depth: number) => {
+      if (depth > 64) return;
+      const list = treeMap[dirPosix];
+      if (!list) return;
+      for (const entry of list) {
+        out.push({ entry, depth });
+        if (entry.kind === 'dir' && expanded.has(entry.path)) {
+          walk(entry.path, depth + 1);
+        }
+      }
+    };
+    walk('', 0);
+    return out;
+  }, [treeMap, expanded]);
+
+  const rootTreeEntries = treeMap[''];
+  const isVirtualTree = !!rootTreeEntries?.length && flatTreeRows.length > TREE_VIRTUAL_THRESHOLD;
+  const treeVirt = useVirtualContainer(treeScrollRef, tab === 'files' && isVirtualTree);
+  const { setScrollTop: setTreeScrollTop } = treeVirt;
+
+  useEffect(() => {
+    setTreeScrollTop(0);
+    if (treeScrollRef.current) treeScrollRef.current.scrollTop = 0;
+  }, [projectId, tab, setTreeScrollTop]);
+
+  const treeSlice = useMemo(
+    () => (isVirtualTree
+      ? computeVirtualSlice(flatTreeRows.length, treeVirt.scrollTop, treeVirt.height, TREE_ROW_REM, treeVirt.remPx, TREE_OVERSCAN)
+      : { startIdx: 0, endIdx: flatTreeRows.length, topPad: 0, bottomPad: 0 }),
+    [isVirtualTree, flatTreeRows.length, treeVirt.scrollTop, treeVirt.height, treeVirt.remPx],
+  );
+  const visibleTreeRows = useMemo(
+    () => flatTreeRows.slice(treeSlice.startIdx, treeSlice.endIdx),
+    [flatTreeRows, treeSlice.startIdx, treeSlice.endIdx],
+  );
 
   return (
     <section
@@ -758,58 +976,121 @@ export function Inspector({
           {sideOpen && (
             <aside className="insp-side" data-testid="insp-side">
               {tab === 'changes' ? (
-                changesGit === null && git === null ? (
+                changesError ? (
+                  <div className="insp-empty-hint" data-testid="insp-changes-error">
+                    <div>{changesError}</div>
+                    <button
+                      type="button"
+                      className="ghost insp-retry-btn"
+                      data-testid="insp-retry"
+                      onClick={() => void fetchChanges(projectId, !changePath, true)}
+                    >
+                      重试
+                    </button>
+                  </div>
+                ) : !isChangesReady ? (
+                  <div className="insp-empty-hint" data-testid="insp-loading-hint">正在检查工作区改动…</div>
+                ) : changesGit === null ? (
                   <div className="insp-empty-hint">当前目录不是 Git 仓库，可切到「文件」标签浏览编辑。</div>
                 ) : changes.length === 0 ? (
                   <div className="insp-empty-hint" data-testid="insp-clean-hint">工作区干净，没有未提交的改动。</div>
                 ) : (
-                  <div className="insp-change-list" data-testid="insp-change-list">
-                    {changes.map((item) => {
-                      const { dir, base } = splitDirBase(item.path);
-                      const on = changePath === item.path;
-                      return (
-                        <div
-                          key={item.path}
-                          className={`change-row ${on ? 'on' : ''}`}
-                          data-testid="change-entry"
-                          data-path={item.path}
-                          data-status={item.status}
-                          onClick={() => {
-                            if (changePath === item.path) return;
-                            if (!confirmDiscardDraft()) return;
-                            setChangePath(item.path);
-                            setChangeMode('diff');
+                  <>
+                    {(changes.length >= 15 || changeFilter !== '') && (
+                      <div className="change-filter-bar">
+                        <input
+                          type="text"
+                          className="change-filter-input"
+                          data-testid="change-filter-input"
+                          placeholder="过滤路径…"
+                          value={changeFilter}
+                          onChange={(e) => setChangeFilter(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape' && changeFilter) {
+                              e.stopPropagation();
+                              setChangeFilter('');
+                            }
                           }}
-                        >
-                          <span className={`git-badge st-${item.status === '?' ? 'U2' : item.status}`} title={STATUS_TITLE[item.status]}>
-                            {item.status}
-                          </span>
-                          <span className="change-names" data-private="" title={item.origPath ? `${item.origPath} → ${item.path}` : item.path}>
-                            <span className="change-base">{base}</span>
-                            {dir && <span className="change-dir">{dir}</span>}
-                          </span>
-                          <span className="change-numstat">
-                            {item.added !== null && item.added > 0 && <span className="num-add">+{item.added}</span>}
-                            {item.deleted !== null && item.deleted > 0 && <span className="num-del">-{item.deleted}</span>}
-                          </span>
+                        />
+                        {changeFilter && (
                           <button
                             type="button"
-                            className="icon-btn change-discard"
-                            data-testid="discard-file"
-                            title={item.status === '?' ? '删除未跟踪文件' : '放弃未提交改动并还原到 HEAD'}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void discardSingle(item);
-                            }}
+                            className="icon-btn change-filter-clear"
+                            title="清空过滤"
+                            onClick={() => setChangeFilter('')}
                           >
-                            <svg viewBox="0 0 16 16" aria-hidden="true">
-                              <path d="M4.5 6.5H10a3 3 0 1 1 0 6H7M6.5 4L4 6.5 6.5 9" />
-                            </svg>
+                            ×
                           </button>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        )}
+                        <span className="change-filter-count">
+                          {changeFilter ? `${filteredChanges.length}/${changes.length}` : changes.length}
+                        </span>
+                      </div>
+                    )}
+                    {changesTruncated && (
+                      <div className="insp-trunc-hint" data-testid="insp-trunc-hint">
+                        改动过多，仅展示前 {changes.length} 项（可输入路径过滤）
+                      </div>
+                    )}
+                    {filteredChanges.length === 0 ? (
+                      <div className="insp-empty-hint">没有匹配「{changeFilter}」的改动</div>
+                    ) : (
+                      <div
+                        ref={changeListRef}
+                        className={`insp-change-list${isVirtualChanges ? ' is-virtual' : ''}`}
+                        data-testid="insp-change-list"
+                        onScroll={isVirtualChanges ? (e) => changeVirt.setScrollTop(e.currentTarget.scrollTop) : undefined}
+                      >
+                        {changeSlice.topPad > 0 && <div style={{ height: changeSlice.topPad, flex: 'none' }} aria-hidden="true" />}
+                        {visibleChanges.map((item) => {
+                          const { dir, base } = splitDirBase(item.path);
+                          const on = changePath === item.path;
+                          return (
+                            <div
+                              key={item.path}
+                              className={`change-row ${on ? 'on' : ''}`}
+                              data-testid="change-entry"
+                              data-path={item.path}
+                              data-status={item.status}
+                              onClick={() => {
+                                if (changePath === item.path) return;
+                                if (!confirmDiscardDraft()) return;
+                                setChangePath(item.path);
+                                setChangeMode('diff');
+                              }}
+                            >
+                              <span className={`git-badge st-${item.status === '?' ? 'U2' : item.status}`} title={STATUS_TITLE[item.status]}>
+                                {item.status}
+                              </span>
+                              <span className="change-names" data-private="" title={item.origPath ? `${item.origPath} → ${item.path}` : item.path}>
+                                <span className="change-base">{base}</span>
+                                {dir && <span className="change-dir">{dir}</span>}
+                              </span>
+                              <span className="change-numstat">
+                                {item.added !== null && item.added > 0 && <span className="num-add">+{item.added}</span>}
+                                {item.deleted !== null && item.deleted > 0 && <span className="num-del">-{item.deleted}</span>}
+                              </span>
+                              <button
+                                type="button"
+                                className="icon-btn change-discard"
+                                data-testid="discard-file"
+                                title={item.status === '?' ? '删除未跟踪文件' : '放弃未提交改动并还原到 HEAD'}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void discardSingle(item);
+                                }}
+                              >
+                                <svg viewBox="0 0 16 16" aria-hidden="true">
+                                  <path d="M4.5 6.5H10a3 3 0 1 1 0 6H7M6.5 4L4 6.5 6.5 9" />
+                                </svg>
+                              </button>
+                            </div>
+                          );
+                        })}
+                        {changeSlice.bottomPad > 0 && <div style={{ height: changeSlice.bottomPad, flex: 'none' }} aria-hidden="true" />}
+                      </div>
+                    )}
+                  </>
                 )
               ) : (
                 <div className="insp-tree" data-testid="insp-tree">
@@ -821,7 +1102,50 @@ export function Inspector({
                     <span>搜索文件…</span>
                     <kbd>Ctrl+P</kbd>
                   </button>
-                  <div className="tree-scroll">{renderTreeNodes('', 0)}</div>
+                  {!rootTreeEntries ? (
+                    <div className="insp-empty-hint">读取目录中…</div>
+                  ) : rootTreeEntries.length === 0 ? (
+                    <div className="insp-empty-hint">空目录</div>
+                  ) : (
+                    <div
+                      ref={treeScrollRef}
+                      className="tree-scroll"
+                      onScroll={isVirtualTree ? (e) => treeVirt.setScrollTop(e.currentTarget.scrollTop) : undefined}
+                    >
+                      {treeSlice.topPad > 0 && <div style={{ height: treeSlice.topPad }} aria-hidden="true" />}
+                      {visibleTreeRows.map(({ entry, depth }) => {
+                        const isOpen = entry.kind === 'dir' && expanded.has(entry.path);
+                        const isSelected = entry.kind === 'file' && filePath === entry.path;
+                        return (
+                          <button
+                            key={entry.path}
+                            type="button"
+                            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${entry.ignored ? 'ignored' : ''}`}
+                            style={{ paddingLeft: `${0.5 + depth * 0.8125}rem` }}
+                            data-testid="tree-entry"
+                            data-path={entry.path}
+                            data-kind={entry.kind}
+                            onClick={() => (entry.kind === 'dir' ? toggleDir(entry.path) : pickFileFromTreeOrFinder(entry.path))}
+                          >
+                            {entry.kind === 'dir' ? (
+                              <svg className={`tree-chev ${isOpen ? 'open' : ''}`} viewBox="0 0 16 16" aria-hidden="true">
+                                <path d="M6 4l4 4-4 4" />
+                              </svg>
+                            ) : (
+                              <span className="tree-file-dot" />
+                            )}
+                            <span className="tree-name" data-private="">{entry.name}</span>
+                            {entry.gitStatus && (
+                              <span className={`git-badge st-${entry.gitStatus === '?' ? 'U2' : entry.gitStatus}`} title={STATUS_TITLE[entry.gitStatus]}>
+                                {entry.gitStatus}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                      {treeSlice.bottomPad > 0 && <div style={{ height: treeSlice.bottomPad }} aria-hidden="true" />}
+                    </div>
+                  )}
                 </div>
               )}
             </aside>
@@ -837,7 +1161,7 @@ export function Inspector({
                   {isDirty && <span className="unsaved-dot" data-testid="unsaved-dot" title="有未保存的修改">● 未保存</span>}
 
                   <div className="insp-filebar-right">
-                    {tab === 'changes' && diffData && !diffData.binary && !diffData.tooLarge && diffData.status !== 'D' && (
+                    {tab === 'changes' && diffData && !diffData.binary && !diffData.tooLarge && !diffData.isDirectory && diffData.status !== 'D' && (
                       <span className="seg" role="radiogroup" aria-label="变更视图">
                         <button
                           type="button"
@@ -891,7 +1215,7 @@ export function Inspector({
                       </span>
                     )}
 
-                    {((tab === 'changes' && changeMode === 'edit' && diffData && !diffData.binary && !diffData.tooLarge && diffData.status !== 'D')
+                    {((tab === 'changes' && changeMode === 'edit' && diffData && !diffData.binary && !diffData.tooLarge && !diffData.isDirectory && diffData.status !== 'D')
                       || (tab === 'files' && fileData?.kind === 'text' && (!isMarkdownPath(activePath) || mdMode === 'source'))) && (
                       <button
                         type="button"
@@ -939,6 +1263,11 @@ export function Inspector({
                   ) : tab === 'changes' ? (
                     !diffData ? (
                       <div className="insp-placeholder">选择左侧改动文件查看对比</div>
+                    ) : diffData.isDirectory ? (
+                      <div className="insp-placeholder" data-testid="guard-directory">
+                        <div>该项是子目录或嵌套 Git 仓库，不支持文本对比。</div>
+                        <button type="button" onClick={() => void openExternal()}>在外部打开</button>
+                      </div>
                     ) : diffData.tooLarge ? (
                       <div className="insp-placeholder" data-testid="guard-too-large">
                         <div>文件体积较大（{formatBytes(diffData.size)}），为保证流畅不在面板内渲染对比。</div>
@@ -1027,7 +1356,15 @@ export function Inspector({
             ) : (
               <div className="insp-placeholder">
                 {tab === 'changes'
-                  ? (changes.length ? '点击左侧改动文件查看行内对比或直接编辑' : '当前项目没有未提交改动，可切到「文件」浏览代码')
+                  ? (changesError
+                    ? '改动列表读取失败，请在左侧点击重试'
+                    : !isChangesReady
+                      ? '正在检查工作区改动…'
+                      : changes.length
+                        ? (changes.length > AUTO_PICK_LIMIT
+                          ? `共有 ${changes.length} 项改动（已跳过自动对比以防卡顿），请点击左侧文件或使用过滤框选择`
+                          : '点击左侧改动文件查看行内对比或直接编辑')
+                        : '当前项目没有未提交改动，可切到「文件」浏览代码')
                   : '从左侧目录树选择文件，或按 Ctrl+P 快速搜索文件'}
               </div>
             )}

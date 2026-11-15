@@ -24,6 +24,46 @@ use tauri_plugin_window_state::StateFlags;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const SPLASH_HOST: &str = "tauri.localhost";
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const WAIT_OBJECT_0: u32 = 0;
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+extern "system" {
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut std::ffi::c_void;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    fn GetLastError() -> u32;
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } != ERROR_ACCESS_DENIED;
+    }
+    let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    let res = unsafe { WaitForSingleObject(handle, ms) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    res == WAIT_OBJECT_0
+}
+
+fn kill_pid_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = wait_for_pid_exit(pid, Duration::from_secs(5));
+}
 
 static CONNECTING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -149,6 +189,8 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
             return Err(format!("服务启动失败（{status}），日志：{}\n\n{}", err_path.display(), tail(&err_path, 20)));
         }
         if Instant::now() > deadline {
+            kill_pid_tree(child.id());
+            SERVER_PID.store(0, Ordering::SeqCst);
             return Err(format!("30 秒内服务没有就绪，日志：{}", out_path.display()));
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -157,26 +199,37 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
 }
 
 // Same path as Ctrl+C on the server: it waits for freshly started claude sessions before killing them. If it does
-// not stop in time and this shell started it, end its process tree.
-fn stop_server(port: u16) {
-    if matches!(request(port, "POST", "/api/shutdown"), Some((202, _))) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while server_ready(port) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(200));
+// not stop in time and this shell started it (or /api/shutdown reported its pid), end its process tree.
+fn stop_server(port: u16, has_live_sessions: bool) {
+    let mut pid = SERVER_PID.load(Ordering::SeqCst);
+    let grace = if has_live_sessions { Duration::from_secs(12) } else { Duration::from_secs(5) };
+    if let Some((202, body)) = request(port, "POST", "/api/shutdown") {
+        if let Some(p) = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("pid").and_then(|x| x.as_u64()))
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|&x| x != 0)
+        {
+            pid = p;
         }
-        if !server_ready(port) {
-            return;
+        if pid != 0 {
+            if wait_for_pid_exit(pid, grace) {
+                SERVER_PID.store(0, Ordering::SeqCst);
+                return;
+            }
+        } else {
+            let deadline = Instant::now() + grace;
+            while port_taken(port) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if !port_taken(port) {
+                return;
+            }
         }
     }
-    let pid = SERVER_PID.load(Ordering::SeqCst);
     if pid != 0 {
-        let _ = Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        kill_pid_tree(pid);
+        SERVER_PID.store(0, Ordering::SeqCst);
     }
 }
 
@@ -209,8 +262,8 @@ fn quit(app: &AppHandle) {
         if let Some(w) = app.get_webview_window("main") {
             let _ = w.hide();
         }
-        if live.is_some() {
-            stop_server(port);
+        if live.is_some() || SERVER_PID.load(Ordering::SeqCst) != 0 {
+            stop_server(port, live.unwrap_or(0) > 0);
         }
         app.exit(0);
     });

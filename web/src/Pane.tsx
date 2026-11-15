@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
-import type { Card, Project, QuotaInfo, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
+import type { ActivityPhase, Card, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
 import { AGENT_LABEL, canResume } from '../../shared/protocol.ts';
 import { attach, fitEntry, focusOnly } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
@@ -19,6 +19,9 @@ interface Props {
   now: number;
   quota?: QuotaInfo;
   metrics?: TaskMetrics;
+  activity?: SessionActivity;
+  onInterrupt?(): void;
+  onInspectFile?(filePath: string): void;
   onFocus(): void;
   onRename(title: string): void;
   onResume(fresh: boolean): void;
@@ -32,6 +35,201 @@ interface Props {
 }
 
 export const SESSION_DRAG_TYPE = 'application/x-wb-session';
+export const ACTIVITY_STALL_MS = 60_000;
+
+const PHASE_LABEL: Record<ActivityPhase, string> = {
+  thinking: '思考规划',
+  tool: '执行工具',
+  subagent: '等待子代理',
+  compacting: '压缩上下文',
+  error: '步骤异常',
+};
+
+function fmtClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}:${String(rem).padStart(2, '0')}`;
+  const h = Math.floor(m / 60);
+  return `${h}:${String(m % 60).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
+function fmtNoProgress(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  if (s < 120) return `已 ${s} 秒无新进展`;
+  return `已 ${Math.floor(s / 60)}分${s % 60}秒无新进展`;
+}
+
+function fileBase(p: string): string {
+  return p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
+}
+
+// Floating live activity HUD overlaid inside .pane-stage: position:absolute so .pane-body never resizes or clears ConPTY.
+function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus }: {
+  activity: SessionActivity;
+  now: number;
+  onInterrupt?(): void;
+  onInspectFile?(filePath: string): void;
+  onRestoreFocus?(): void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const privacy = usePrivacy();
+
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+        onRestoreFocus?.();
+      }
+    };
+    document.addEventListener('mousedown', away);
+    window.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', away);
+      window.removeEventListener('keydown', onKey, true);
+    };
+  }, [open, onRestoreFocus]);
+
+  const turnSec = Math.max(0, Math.floor((now - activity.turnStartedAt) / 1000));
+  const idleMs = Math.max(0, now - activity.lastProgressAt);
+  const idleSec = Math.floor(idleMs / 1000);
+  const stalled = idleMs >= ACTIVITY_STALL_MS;
+  const writtenSet = new Set(activity.filesWritten);
+  const touchedFiles = [
+    ...activity.filesWritten,
+    ...activity.filesRead.filter((f) => !writtenSet.has(f)),
+  ].slice(0, 12);
+  const steps = activity.recentSteps.slice().reverse();
+
+  return (
+    <div
+      className={`activity-hud phase-${activity.phase} ${stalled ? 'stalled' : ''}`}
+      data-testid="activity-hud"
+      data-phase={activity.phase}
+      data-stalled={stalled ? 'true' : 'false'}
+      ref={ref}
+    >
+      <div className="activity-bar">
+        <button
+          type="button"
+          className="activity-pill"
+          data-testid="activity-toggle"
+          aria-expanded={open}
+          title={privacy ? undefined : `${activity.summary}（点击查看步骤与文件详情）`}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span className="activity-dot" aria-hidden="true" />
+          <span className="activity-summary" data-testid="activity-summary" data-private="">
+            {activity.summary}
+          </span>
+          {activity.stepCount > 0 && (
+            <span className="activity-steps-count" data-testid="activity-step-count">
+              #{activity.stepCount}
+            </span>
+          )}
+          <span className="activity-elapsed" data-testid="activity-elapsed" title="本轮已耗时">
+            {fmtClock(turnSec)}
+          </span>
+          {stalled && (
+            <span className="activity-stall-badge" data-testid="activity-stall-badge">
+              {fmtNoProgress(idleSec)}
+            </span>
+          )}
+          <svg className={`activity-chev ${open ? 'on' : ''}`} viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M4.5 6l3.5 4 3.5-4" />
+          </svg>
+        </button>
+        {stalled && onInterrupt && (
+          <button
+            type="button"
+            className="activity-interrupt"
+            data-testid="activity-interrupt"
+            title="向终端发送 Esc 中断当前卡住的步骤（不关闭会话）"
+            onClick={(e) => {
+              e.stopPropagation();
+              onInterrupt();
+            }}
+          >
+            发送 Esc 中断
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="activity-popover" data-testid="activity-popover">
+          <div className="activity-popover-head">
+            <span className="activity-phase-tag">{PHASE_LABEL[activity.phase]}</span>
+            {activity.model && <span className="activity-model-tag">{activity.model}</span>}
+            <span className="activity-meta-stats">
+              本轮 {fmtClock(turnSec)} · 距上次进展 {idleSec}s
+            </span>
+            {onInterrupt && (
+              <button
+                type="button"
+                className="ghost activity-popover-esc"
+                data-testid="activity-popover-interrupt"
+                title="向当前终端发送 Esc 键"
+                onClick={() => onInterrupt()}
+              >
+                发送 Esc
+              </button>
+            )}
+          </div>
+          {activity.thinkingSnippet && (
+            <div className="activity-thinking" data-testid="activity-thinking" data-private="">
+              {activity.thinkingSnippet}
+            </div>
+          )}
+          {steps.length > 0 && (
+            <div className="activity-steps" data-testid="activity-steps">
+              {steps.map((st, idx) => (
+                <div key={`${st.at}-${idx}`} className={`activity-step is-${st.status ?? 'done'}`} data-testid="activity-step">
+                  <span className="activity-step-dot" aria-hidden="true" />
+                  <span className="activity-step-label" data-private="" title={privacy ? undefined : st.detail ?? st.summary}>
+                    {st.summary}
+                  </span>
+                  {st.detail && <span className="activity-step-tool">{st.detail}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+          {touchedFiles.length > 0 && (
+            <div className="activity-files" data-testid="activity-files">
+              {touchedFiles.map((fp) => {
+                const isWrite = writtenSet.has(fp);
+                return (
+                  <button
+                    type="button"
+                    key={fp}
+                    className={`activity-file ${isWrite ? 'is-write' : 'is-read'}`}
+                    data-testid="activity-file"
+                    data-file-path={fp}
+                    data-private=""
+                    title={privacy ? undefined : `${isWrite ? '已修改' : '已读取'}：${fp}`}
+                    onClick={() => {
+                      onInspectFile?.(fp);
+                      setOpen(false);
+                    }}
+                  >
+                    <span className="activity-file-kind">{isWrite ? '改' : '读'}</span>
+                    <span className="activity-file-name">{fileBase(fp)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Floating popover anchored below the header's 待验收 split pill: never alters .pane-body height or triggers PTY resize.
 function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForward }: {
@@ -44,19 +242,22 @@ function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForwa
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const handlersRef = useRef({ onClose, onEscape });
+  handlersRef.current = { onClose, onEscape };
   const privacy = usePrivacy();
-  const summary = card.body.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  const bodyText = typeof card.body === 'string' ? card.body : '';
+  const summary = bodyText.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
 
   useEffect(() => {
     ref.current?.querySelector<HTMLButtonElement>('.review-item')?.focus();
     const away = (e: MouseEvent) => {
       const t = e.target as Node | null;
-      if (t && !ref.current?.contains(t) && !toggleRef.current?.contains(t)) onClose();
+      if (t && !ref.current?.contains(t) && !toggleRef.current?.contains(t)) handlersRef.current.onClose();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        onEscape();
+        handlersRef.current.onEscape();
       }
     };
     document.addEventListener('mousedown', away);
@@ -65,7 +266,7 @@ function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForwa
       document.removeEventListener('mousedown', away);
       document.removeEventListener('keydown', onKey);
     };
-  }, [onClose, onEscape, toggleRef]);
+  }, [toggleRef]);
 
   const move = (dir: number) => {
     const items = [...(ref.current?.querySelectorAll<HTMLButtonElement>('.review-item') ?? [])];
@@ -125,7 +326,7 @@ function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForwa
             {open ? '收起原文' : '查看原文'}
           </button>
         </div>
-        {open && <div className="review-body" data-testid="review-body" data-private="">{card.body}</div>}
+        {open && <div className="review-body" data-testid="review-body" data-private="">{bodyText}</div>}
       </div>
     </div>
   );
@@ -179,7 +380,7 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const reviewToggleRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
@@ -214,6 +415,10 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   const [dropOver, setDropOver] = useState(false);
   const style = { '--c': task?.color ?? 'var(--text-3)' } as CSSProperties;
   const wantsSession = (e: DragEvent) => !!onDropSession && e.dataTransfer.types.includes(SESSION_DRAG_TYPE);
+  const onPaneFocusCapture = (e: { target: EventTarget | null }) => {
+    if ((e.target as Element | null)?.closest?.('.activity-hud')) return;
+    onFocus();
+  };
   return (
     <div
       className={`pane ${focused ? 'focused' : ''} ${dual ? 'dual' : ''} ${dropOver ? 'drop-over' : ''}`}
@@ -222,8 +427,8 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
       data-pane-index={index}
       data-session-id={sessionId ?? ''}
       data-focused={focused ? 'true' : 'false'}
-      onMouseDownCapture={onFocus}
-      onFocusCapture={onFocus}
+      onMouseDownCapture={onPaneFocusCapture}
+      onFocusCapture={onPaneFocusCapture}
       onDragOver={(e) => {
         if (!wantsSession(e)) return;
         e.preventDefault();
@@ -316,7 +521,25 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
       )}
       {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} />}
       <div className="pane-stage">
-        <div className="pane-body" ref={bodyRef} />
+        <div
+          className="pane-body"
+          ref={bodyRef}
+          onMouseDown={(e) => {
+            if (sessionId && e.target === e.currentTarget) focusOnly(sessionId);
+          }}
+        />
+        {session?.status === 'working' && activity && (
+          <ActivityHud
+            key={sessionId ?? 'none'}
+            activity={activity}
+            now={now}
+            onInterrupt={onInterrupt}
+            onInspectFile={onInspectFile}
+            onRestoreFocus={() => {
+              if (!dual || focused) focusOnly(sessionId);
+            }}
+          />
+        )}
         {!!session?.queued && (
           <div className="pane-queued" data-testid="pane-queued">消息排队中，agent 空闲后自动发送</div>
         )}

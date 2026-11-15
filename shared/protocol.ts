@@ -21,6 +21,24 @@ export interface Project {
 // A turn starting in the task's session moves approved / review / archived back to active.
 export type TaskPhase = 'active' | 'review' | 'approved' | 'archived';
 
+export interface AgyModelOption {
+  slug: string; // '' = follow global ~/.gemini/antigravity-cli/settings.json default
+  label: string;
+  desc: string;
+}
+
+// Curated Gemini 4 / Orchestrator tiers for Antigravity CLI (gemini-3.8-flash* is intentionally excluded).
+export const AGY_MODELS: readonly AgyModelOption[] = [
+  { slug: '', label: '跟随全局默认（settings.json）', desc: '沿用 ~/.gemini/antigravity-cli/settings.json 中的默认模型' },
+  { slug: 'gemini-pro-orchestrator', label: 'Orchestrator (Carbon) · 推荐', desc: 'Carbon 顶层规划与终审 + Hydrogen 高速改码自检' },
+  { slug: 'gemini-4-hydrogen-medium', label: 'Gemini 4 Hydrogen (Medium)', desc: '日常维护、脚本与单测高速执行' },
+  { slug: 'gemini-4-carbon-medium', label: 'Gemini 4 Carbon (Medium)', desc: '单模型均衡深度推理' },
+  { slug: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon (High)', desc: '复杂架构设计、隐蔽并发与安全审计' },
+] as const;
+
+export const isValidAgyModel = (slug: unknown): slug is string =>
+  typeof slug === 'string' && AGY_MODELS.some(m => m.slug === slug);
+
 export interface Task {
   id: string;
   projectId: string;
@@ -29,6 +47,7 @@ export interface Task {
   titleAuto: boolean; // true = title was generated and may still be replaced by the first prompt
   color: string; // CSS color, assigned by the server from TASK_COLORS
   agent: AgentKind;
+  model?: string; // optional per-task CLI model slug (currently used for agy --model <slug>)
   sessionId: string | null; // current session
   createdAt: number;
   phase: TaskPhase; // missing in state saved before M2: loaded as 'active'
@@ -59,6 +78,8 @@ export interface ChangedFile {
 export interface ProjectChanges {
   git: GitInfo | null;
   files: ChangedFile[];
+  truncated?: boolean; // true when total dirty entries exceeded MAX_CHANGED_FILES
+  statsSkipped?: boolean; // true when untracked/added count exceeded MAX_UNTRACKED_LINE_STAT
 }
 
 export interface TreeEntry {
@@ -98,6 +119,7 @@ export interface DiffPayload {
   head: string; // working tree content ('' for deleted)
   binary: boolean;
   tooLarge: boolean;
+  isDirectory?: boolean; // true for submodule gitlinks or untracked nested git directories
   size: number;
   mtimeMs: number | null;
 }
@@ -127,7 +149,16 @@ export interface Card {
   kind: CardKind;
   body: string; // plain text, capped at CARD_MAX chars by the server
   createdAt: number;
-  meta?: { from?: AgentKind; to?: AgentKind; generated?: boolean; sourceTaskId?: string; sourceCardId?: string };
+  meta?: {
+    from?: AgentKind;
+    to?: AgentKind;
+    generated?: boolean;
+    sourceTaskId?: string;
+    sourceCardId?: string;
+    replyBack?: boolean;
+    isAutoReply?: boolean;
+    peerHop?: number;
+  };
 }
 
 export const CARD_MAX = 50_000;
@@ -169,9 +200,36 @@ export interface QuotaInfo {
   at: number; // ms epoch when observed
 }
 
+export type ActivityPhase = 'thinking' | 'tool' | 'subagent' | 'compacting' | 'error';
+
+export interface ActivityStep {
+  at: number; // ms epoch when observed
+  kind: 'plan' | 'tool' | 'note' | 'error';
+  summary: string; // concise human-readable Chinese / tool summary
+  detail?: string; // optional raw tool name or secondary context
+  status?: 'running' | 'done' | 'error';
+}
+
+// Live white-box execution state for a working session, derived from lifecycle hooks and incremental transcript tailing.
+// Never persisted to state.json; cleared when the session stops working or exits.
+export interface SessionActivity {
+  sessionId: string;
+  turnStartedAt: number; // ms epoch when the current working turn began
+  lastProgressAt: number; // ms epoch of the latest observable hook / transcript progress (never bumped by PTY redraws)
+  phase: ActivityPhase;
+  summary: string; // current one-line Chinese status shown in Pane HUD & sidebar TaskRow
+  model?: string; // active model reported by hook or transcript
+  stepCount: number; // steps observed in the current turn
+  thinkingSnippet?: string; // latest short snippet of planner progress/thinking
+  recentSteps: ActivityStep[]; // newest last, capped by server
+  filesRead: string[]; // recent distinct file paths read in this turn
+  filesWritten: string[]; // recent distinct file paths written/edited in this turn
+}
+
 // Workbench-wide settings, stored in the state file.
 export interface Settings {
   aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
+  agyModel?: string; // default model slug passed to new Antigravity tasks ('' or undefined = follow global settings.json)
 }
 export const DEFAULT_SETTINGS: Settings = { aiTitles: false };
 
@@ -185,6 +243,7 @@ export interface Snapshot {
   git: Record<string, GitInfo | null>; // by project id; null = not a git repo. Derived, not stored in state.json
   quota: Partial<Record<AgentKind, QuotaInfo>>; // from <stateDir>/quota.json
   telemetry?: TelemetrySummary; // derived live token / cache / speed telemetry from usage.ts
+  activity?: Record<string, SessionActivity>; // by sessionId for currently working sessions
 }
 
 // Nine muted colors that stay distinguishable on a dark background.
@@ -327,6 +386,7 @@ export interface CreateTaskBody {
   projectId: string;
   title?: string; // empty/missing: derived from prompt, else "新任务 N" (titleAuto)
   agent: AgentKind;
+  model?: string; // optional CLI model slug (for agy)
   prompt?: string;
   cols?: number;
   rows?: number;
@@ -390,6 +450,7 @@ export interface SwitchResult {
 export interface ForwardBody {
   to: { taskId: string } | { projectId: string; agent: AgentKind };
   note?: string;
+  replyBack?: boolean;
   cols?: number;
   rows?: number;
 }
@@ -398,12 +459,59 @@ export interface ForwardResult {
   task: Task; // the target task
   session: SessionInfo;
   card: Card; // the forward card saved on the target
+  replyBack?: boolean;
+}
+
+export interface PeerTaskSummary {
+  index: number; // 1-based '#1', '#2' within project
+  id: string;
+  title: string;
+  agent: AgentKind;
+  phase: TaskPhase;
+  status: SessionStatus | 'none';
+  isSelf: boolean;
+  lastPrompt?: string;
+  latestReplyFile?: string;
+}
+
+export interface PeerListResult {
+  projectId: string;
+  projectName: string;
+  selfTaskId: string;
+  peersFile: string;
+  tasks: PeerTaskSummary[];
+}
+
+export interface PeerSendBody {
+  target: string;
+  note?: string;
+  stdinText?: string;
+  filePath?: string;
+  replyBack?: boolean;
+  createIfAgent?: boolean;
+}
+
+export interface PeerSendResult {
+  targetTaskId: string;
+  targetTitle: string;
+  targetAgent: AgentKind;
+  created: boolean;
+  queued: boolean;
+  replyBack: boolean;
+  hop: number;
 }
 
 export const FORWARD_NOTE = '下面是另一个任务的结果，供你参考。';
 
-export function forwardText(source: { title: string; agent: AgentKind }, body: string, note?: string): string {
-  return [note?.trim() || FORWARD_NOTE, '', `## 转发自任务「${source.title}」（${AGENT_LABEL[source.agent]}）`, body.trim()].join('\n');
+export function forwardText(
+  source: { title: string; agent: AgentKind },
+  body: string,
+  note?: string,
+  opts?: { replyBack?: boolean },
+): string {
+  const base = [note?.trim() || FORWARD_NOTE, '', `## 转发自任务「${source.title}」（${AGENT_LABEL[source.agent]}）`, body.trim()].join('\n');
+  if (!opts?.replyBack) return base;
+  return `${base}\n\n（注：你完成本轮回复后，工作台会自动把你的结论回传给任务「${source.title}」。）`;
 }
 
 // Initial prompt of the new session started by feedback mode 'new'.
@@ -446,6 +554,7 @@ export type ServerMsg =
   | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
   | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
+  | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
   | { t: 'out'; id: string; d: string };

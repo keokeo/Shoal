@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  MAX_TEXT_BYTES, WorkspaceError, discardFile, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
+  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, discardFile, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
 } from './workspace.ts';
+import { gitInfo } from './git.ts';
 import { matchProjectFileLink, parseLocalFileLink } from '../web/src/linkParse.ts';
 
 const tempDirs: string[] = [];
@@ -228,5 +229,94 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(matchProjectFileLink('G:\\Workspace\\app\\tool.exe', projects)).toBeNull();
     expect(matchProjectFileLink('G:\\Workspace\\app\\.git\\config', projects)).toBeNull();
     expect(matchProjectFileLink('C:\\Temp\\random.ts#L3', projects)).toBeNull();
+  });
+});
+
+describe('workspace large changes & git consistency', () => {
+  it('skips untracked line stats above threshold while matching gitInfo dirty count', async () => {
+    const repo = initRepo('many-untracked');
+    fs.writeFileSync(path.join(repo, 'tracked.ts'), 'const a = 1;\n', 'utf8');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-q', '-m', 'init']);
+
+    fs.writeFileSync(path.join(repo, 'tracked.ts'), 'const a = 1;\nconst b = 2;\n', 'utf8');
+    const untrackedTotal = MAX_UNTRACKED_LINE_STAT + 120;
+    const bulkDir = path.join(repo, 'bulk');
+    fs.mkdirSync(bulkDir);
+    for (let i = 0; i < untrackedTotal; i++) {
+      fs.writeFileSync(path.join(bulkDir, `f-${String(i).padStart(4, '0')}.txt`), 'line1\nline2\n', 'utf8');
+    }
+
+    const t0 = Date.now();
+    const [changes, info] = await Promise.all([listChanges(repo), gitInfo(repo)]);
+    const elapsedMs = Date.now() - t0;
+
+    expect(elapsedMs).toBeLessThan(5000);
+    expect(changes.statsSkipped).toBe(true);
+    expect(changes.files.length).toBe(untrackedTotal + 1);
+    expect(changes.git?.dirty).toBe(untrackedTotal + 1);
+    expect(info?.dirty).toBe(changes.git?.dirty);
+
+    const tracked = changes.files.find((f) => f.path === 'tracked.ts');
+    expect(tracked).toEqual({ path: 'tracked.ts', status: 'M', added: 1, deleted: 0 });
+
+    const sampleUntracked = changes.files.find((f) => f.path === 'bulk/f-0000.txt');
+    expect(sampleUntracked).toEqual({ path: 'bulk/f-0000.txt', status: '?', added: null, deleted: null });
+  });
+
+  it('deduplicates git rm --cached + untracked same path and guards nested git directory diff', async () => {
+    const repo = initRepo('dedup-dir');
+    fs.writeFileSync(path.join(repo, 'cached.ts'), 'export const x = 1;\n', 'utf8');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-q', '-m', 'init']);
+
+    // Staged delete (`D `) + untracked file (`??`) on the same path
+    git(repo, ['rm', '--cached', '-q', 'cached.ts']);
+    fs.writeFileSync(path.join(repo, 'cached.ts'), 'export const x = 2;\n', 'utf8');
+
+    // Nested git repository appears in parent git status as `sub/`
+    const subDir = path.join(repo, 'nested-repo');
+    fs.mkdirSync(subDir);
+    git(subDir, ['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(subDir, 'inner.txt'), 'hi\n', 'utf8');
+
+    const changes = await listChanges(repo);
+    const cachedMatches = changes.files.filter((f) => f.path === 'cached.ts');
+    expect(cachedMatches).toHaveLength(1);
+    expect(cachedMatches[0].status).toBe('M');
+
+    const nested = changes.files.find((f) => f.path === 'nested-repo');
+    expect(nested).toEqual({ path: 'nested-repo', status: '?', added: null, deleted: null });
+
+    const dirDiff = await readDiff(repo, 'nested-repo');
+    expect(dirDiff.isDirectory).toBe(true);
+    expect(dirDiff.binary).toBe(false);
+    expect(dirDiff.head).toBe('');
+  });
+
+  it('handles concurrent listChanges/listTree and invalidates porcelain cache on writeFileEntry', async () => {
+    const repo = initRepo('cache-invalidate');
+    fs.writeFileSync(path.join(repo, 'base.txt'), 'ok\n', 'utf8');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-q', '-m', 'init']);
+
+    const [c1, tree1, c2, info1] = await Promise.all([
+      listChanges(repo),
+      listTree(repo, ''),
+      listChanges(repo),
+      gitInfo(repo),
+    ]);
+    expect(c1.files).toEqual([]);
+    expect(c2.files).toEqual([]);
+    expect(info1?.dirty).toBe(0);
+    expect(tree1.entries.map((e) => e.name)).toContain('base.txt');
+
+    // Write immediately within the 250ms porcelain cache window -> cache must be invalidated
+    const initial = readFileEntry(repo, 'base.txt', true);
+    writeFileEntry(repo, { path: 'base.txt', content: 'updated\n', expectedMtimeMs: initial.mtimeMs });
+    const [c3, info2] = await Promise.all([listChanges(repo), gitInfo(repo)]);
+    expect(c3.files.map((f) => f.path)).toContain('base.txt');
+    expect(c3.git?.dirty).toBe(1);
+    expect(info2?.dirty).toBe(1);
   });
 });

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, ArchiveStoppedResult, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
-import { connect } from './ws.ts';
+import { connect, send } from './ws.ts';
 import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
-import { Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
+import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
@@ -161,8 +161,8 @@ export function App() {
   const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
 
   // Latest state for handlers registered once (WebSocket, window listeners).
-  const live = useRef({ data, panes, focusedPane, layout, dialog });
-  live.current = { data, panes, focusedPane, layout, dialog };
+  const live = useRef({ data, panes, focusedPane, layout, dialog, pinnedInspectProjectId, order });
+  live.current = { data, panes, focusedPane, layout, dialog, pinnedInspectProjectId, order };
 
   const sessionsById = new Map(data.sessions.map((s) => [s.id, s]));
   const tasksById = new Map(data.tasks.map((t) => [t.id, t]));
@@ -264,12 +264,17 @@ export function App() {
   const removeTaskLocal = useCallback((taskId: string) => {
     const gone = live.current.data.sessions.filter((s) => s.taskId === taskId).map((s) => s.id);
     gone.forEach(dispose);
-    setData((d) => ({
-      ...d,
-      tasks: d.tasks.filter((t) => t.id !== taskId),
-      sessions: d.sessions.filter((s) => s.taskId !== taskId),
-      cards: d.cards.filter((c) => c.taskId !== taskId),
-    }));
+    setData((d) => {
+      const nextAct = { ...(d.activity ?? {}) };
+      for (const sid of gone) delete nextAct[sid];
+      return {
+        ...d,
+        tasks: d.tasks.filter((t) => t.id !== taskId),
+        sessions: d.sessions.filter((s) => s.taskId !== taskId),
+        cards: d.cards.filter((c) => c.taskId !== taskId),
+        activity: nextAct,
+      };
+    });
     setPanes((p) => [gone.includes(p[0] ?? '') ? null : p[0], gone.includes(p[1] ?? '') ? null : p[1]]);
   }, []);
 
@@ -279,6 +284,18 @@ export function App() {
     setData((d) => ({ ...d, projects: d.projects.filter((p) => p.id !== projectId) }));
     setCollapsed((c) => (c.has(projectId) ? new Set([...c].filter((x) => x !== projectId)) : c));
   }, [removeTaskLocal]);
+
+  const currentInspectProjectId = useCallback((): string | undefined => {
+    const s = live.current;
+    if (s.pinnedInspectProjectId && s.data.projects.some((p) => p.id === s.pinnedInspectProjectId)) {
+      return s.pinnedInspectProjectId;
+    }
+    const sid = s.panes[s.layout === 2 ? s.focusedPane : 0];
+    const tid = sid ? s.data.sessions.find((x) => x.id === sid)?.taskId : undefined;
+    const fid = tid ? s.data.tasks.find((t) => t.id === tid)?.projectId : undefined;
+    if (fid && s.data.projects.some((p) => p.id === fid)) return fid;
+    return sortProjects(s.data.projects, s.order)[0]?.id;
+  }, []);
 
   const onMsg = useCallback((msg: ServerMsg) => {
     switch (msg.t) {
@@ -295,15 +312,20 @@ export function App() {
           return next;
         });
         setFocusTick((n) => n + 1);
+        setInspectWatchRev((n) => n + 1);
         break;
       }
       case 'project':
         setData((d) => ({ ...d, projects: upsert(d.projects, msg.project) }));
         break;
-      case 'task':
+      case 'task': {
+        const prev = live.current.data.tasks.find((t) => t.id === msg.task.id);
         setData((d) => ({ ...d, tasks: upsert(d.tasks, msg.task) }));
-        setInspectWatchRev((n) => n + 1);
+        if (msg.task.phase === 'review' && prev?.phase !== 'review' && msg.task.projectId === currentInspectProjectId()) {
+          setInspectWatchRev((n) => n + 1);
+        }
         break;
+      }
       case 'task-removed':
         removeTaskLocal(msg.id);
         break;
@@ -313,10 +335,15 @@ export function App() {
       case 'settings':
         setData((d) => ({ ...d, settings: msg.settings }));
         break;
-      case 'git':
+      case 'git': {
+        const prevGit = live.current.data.git[msg.projectId];
+        const changed = prevGit === undefined || JSON.stringify(prevGit) !== JSON.stringify(msg.git);
         setData((d) => ({ ...d, git: { ...d.git, [msg.projectId]: msg.git } }));
-        setInspectWatchRev((n) => n + 1);
+        if (changed && msg.projectId === currentInspectProjectId()) {
+          setInspectWatchRev((n) => n + 1);
+        }
         break;
+      }
       case 'quota':
         setData((d) => ({ ...d, quota: { ...d.quota, [msg.agent]: msg.quota } }));
         break;
@@ -327,7 +354,23 @@ export function App() {
         setData((d) => ({ ...d, cards: upsert(d.cards, msg.card) }));
         break;
       case 'session':
-        setData((d) => ({ ...d, sessions: upsert(d.sessions, msg.session) }));
+        setData((d) => {
+          const sessions = upsert(d.sessions, msg.session);
+          if (msg.session.status !== 'working' && d.activity?.[msg.session.id]) {
+            const nextAct = { ...d.activity };
+            delete nextAct[msg.session.id];
+            return { ...d, sessions, activity: nextAct };
+          }
+          return { ...d, sessions };
+        });
+        break;
+      case 'activity':
+        setData((d) => {
+          const nextAct = { ...(d.activity ?? {}) };
+          if (msg.activity) nextAct[msg.sessionId] = msg.activity;
+          else delete nextAct[msg.sessionId];
+          return { ...d, activity: nextAct };
+        });
         break;
       case 'replay':
         replay(msg.id, msg.d);
@@ -336,7 +379,7 @@ export function App() {
         writeOut(msg.id, msg.d);
         break;
     }
-  }, [removeTaskLocal, removeProjectLocal]);
+  }, [removeTaskLocal, removeProjectLocal, currentInspectProjectId]);
 
   useEffect(
     () =>
@@ -374,6 +417,38 @@ export function App() {
     const seq = ++inspectSeqRef.current;
     setInspectReq({ projectId, tab, filePath, line, col, seq });
   }, [switchLayout]);
+
+  const interruptSession = useCallback((sid: string) => {
+    send({ t: 'in', id: sid, d: '\x1b' });
+    focusOnly(sid);
+    setNotice('已向终端发送 Esc 中断信号');
+  }, []);
+
+  const inspectActivityFile = useCallback(async (rawPath: string, fallbackProject?: Project) => {
+    const candidate = /^[A-Za-z]:[\\/]|^file:/i.test(rawPath.trim()) || !fallbackProject
+      ? rawPath
+      : `${fallbackProject.path.replace(/[\\/]+$/, '')}\\${rawPath.replace(/^[\\/]+/, '')}`;
+    const match = matchProjectFileLink(candidate, live.current.data.projects);
+    if (match) {
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(match.project.id)}/file?path=${encodeURIComponent(match.relPosix)}&stat=1`);
+        if (res.ok) {
+          const stat = (await res.json()) as FilePayload;
+          if (stat.kind === 'text' || stat.kind === 'image') {
+            openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
+            return;
+          }
+        }
+      } catch {
+        // fall through to external open
+      }
+    }
+    try {
+      await post('/api/open', { target: candidate });
+    } catch (e) {
+      setNotice(`无法打开文件：${(e as Error).message}`);
+    }
+  }, [openInspectorAt]);
 
   useEffect(() => {
     window.__wbTermText = termText;
@@ -701,13 +776,18 @@ export function App() {
   };
 
   // Sends a card to another task (queued if it is busy) or to a new one. Throws so the dialog can show the error.
-  const forward = async (card: Card, to: ForwardBody['to'], note: string) => {
+  const forward = async (card: Card, to: ForwardBody['to'], note: string, replyBack: boolean) => {
     const s = live.current;
     const target = 'taskId' in to ? s.data.tasks.find((t) => t.id === to.taskId) : undefined;
     const old = target?.sessionId ?? null;
     const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
-    const r = await post<ForwardResult>(`/api/cards/${encodeURIComponent(card.id)}/forward`, { to, note: note || undefined, ...size });
+    const r = await post<ForwardResult>(`/api/cards/${encodeURIComponent(card.id)}/forward`, {
+      to,
+      note: note || undefined,
+      ...(replyBack ? { replyBack: true } : {}),
+      ...size,
+    });
     const replaced = !!old && r.session.id !== old;
     setData((d) => ({
       ...d,
@@ -721,9 +801,10 @@ export function App() {
     }
     setDialog(null);
     const waiting = !!r.session.queued && r.session.status === 'working';
-    setNotice(!target ? `已转发到新任务「${r.task.title}」`
-      : waiting ? `已转发到「${r.task.title}」，它还在工作，消息排队中，空闲后自动发送`
-      : `已转发到「${r.task.title}」`);
+    const tail = replyBack ? '，完成后将自动回传' : '';
+    setNotice(!target ? `已转发到新任务「${r.task.title}」${tail}`
+      : waiting ? `已转发到「${r.task.title}」，它还在工作，消息排队中，空闲后自动发送${tail}`
+      : `已转发到「${r.task.title}」${tail}`);
   };
 
   const toggleProject = (id: string) =>
@@ -917,6 +998,7 @@ export function App() {
               project={project}
               tasks={data.tasks.filter((t) => t.projectId === project.id && t.phase !== 'archived')}
               sessionsById={sessionsById}
+              activityById={data.activity ?? {}}
               visibleIds={visibleIds}
               focusedId={focusedSessionId}
               now={now}
@@ -964,6 +1046,7 @@ export function App() {
           const id = panes[i];
           const session = id ? sessionsById.get(id) : undefined;
           const task = session ? tasksById.get(session.taskId) : undefined;
+          const project = task ? projectsById.get(task.projectId) : undefined;
           const paneAgent = task?.agent ?? session?.agent;
           const card = task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'result').at(-1) : undefined;
           return (
@@ -973,15 +1056,17 @@ export function App() {
               sessionId={id}
               session={session}
               task={task}
-              project={task ? projectsById.get(task.projectId) : undefined}
+              project={project}
               focused={layout === 2 && focusedPane === i}
               dual={layout === 2}
               now={now}
               quota={paneAgent ? data.quota[paneAgent] : undefined}
               metrics={task ? data.telemetry?.byTask[task.id] : undefined}
+              activity={id ? data.activity?.[id] : undefined}
+              onInterrupt={id ? () => interruptSession(id) : undefined}
+              onInspectFile={(fp) => void inspectActivityFile(fp, project)}
               onFocus={() => {
                 if (layout === 2 && focusedPane !== i) setFocusedPane(i);
-                else if (layout === 'inspect') setFocusTick((n) => n + 1);
               }}
               onRename={(title) => task && renameTask(task, title)}
               onResume={(fresh) => task && void resumeTask(task, fresh)}
@@ -1065,6 +1150,7 @@ export function App() {
           agents={data.agents as AgentKind[]}
           defaultProjectId={focusedProjectId ?? data.projects[0]?.id ?? ''}
           defaultAgent={(pid) => defaultAgentFor(data, pid)}
+          defaultAgyModel={data.settings.agyModel ?? ''}
           size={sizeOf(focusedSessionId) ?? { cols: 120, rows: 36 }}
           onClose={() => setDialog(null)}
           onCreated={(r) => {
@@ -1111,7 +1197,7 @@ export function App() {
           tasks={data.tasks}
           agents={data.agents as AgentKind[]}
           onClose={() => setDialog(null)}
-          onForward={(to, note) => forward(forwardCard, to, note)}
+          onForward={(to, note, replyBack) => forward(forwardCard, to, note, replyBack)}
         />
       )}
       {dialog === 'feedback' && tasksById.get(dialogTarget) && (
@@ -1161,10 +1247,11 @@ function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
+  activityById: Record<string, SessionActivity>;
   visibleIds: (string | null)[];
   focusedId: string | null; // session in the focused pane
   now: number;
@@ -1216,6 +1303,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
       key={task.id}
       task={task}
       session={task.sessionId ? sessionsById.get(task.sessionId) : undefined}
+      activity={task.sessionId ? activityById[task.sessionId] : undefined}
       inPane={!!task.sessionId && visibleIds.includes(task.sessionId)}
       paneFocused={!!task.sessionId && task.sessionId === focusedId}
       paneMark={task.sessionId && visibleIds.length === 2 ? (['左', '右'] as const)[visibleIds.indexOf(task.sessionId)] : undefined}
@@ -1425,9 +1513,10 @@ function QuickMenu({ agents, defaultAgent, onPick, onClose }: {
   );
 }
 
-function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now, onOpen, onRemove, onRename, onResume, onUnarchive }: {
+function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, draggable, now, onOpen, onRemove, onRename, onResume, onUnarchive }: {
   task: Task;
   session?: SessionInfo;
+  activity?: SessionActivity;
   inPane: boolean;
   paneFocused: boolean; // shown in the focused pane
   paneMark?: '左' | '右'; // which pane shows this task (dual layout only)
@@ -1442,12 +1531,20 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
   const status = session?.status ?? 'exited';
   const glyph = rowGlyph(task, session);
   const [editing, setEditing] = useState(false);
+  const liveAct = task.phase === 'active' && status === 'working' ? activity : undefined;
+  const actIdleSec = liveAct ? Math.max(0, Math.floor((now - liveAct.lastProgressAt) / 1000)) : 0;
+  const actStalled = !!liveAct && now - liveAct.lastProgressAt >= ACTIVITY_STALL_MS;
+  const showLiveAct = !!liveAct && (liveAct.stepCount > 0 || liveAct.phase !== 'thinking' || actStalled);
+  const actLine = showLiveAct
+    ? (actStalled ? `已 ${actIdleSec}s 无新进展 · ${liveAct.summary}` : liveAct.summary)
+    : '';
   // The latest prompt as a second line, unless the row is closed or it only repeats the title.
   const lastPrompt = task.lastPrompt ?? '';
-  const preview = task.phase !== 'archived' && status !== 'exited' && lastPrompt && !lastPrompt.startsWith(task.title.replace(/…$/, '')) ? lastPrompt : '';
+  const preview = !showLiveAct && task.phase !== 'archived' && status !== 'exited' && lastPrompt && !lastPrompt.startsWith(task.title.replace(/…$/, '')) ? lastPrompt : '';
+  const hasSecondLine = showLiveAct || !!preview;
   return (
     <div
-      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${preview ? 'has-preview' : ''}`}
+      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${hasSecondLine ? 'has-preview' : ''}`}
       style={{ '--c': task.color } as CSSProperties}
       data-testid="task-row"
       data-task-id={task.id}
@@ -1530,6 +1627,11 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
         </span>
       )}
       <span className="agent-mark" title={AGENT_LABEL[task.agent] ?? task.agent}><AgentIcon agent={task.agent} /></span>
+      {showLiveAct && (
+        <span className={`task-preview is-activity ${actStalled ? 'is-stalled' : ''}`} data-testid="task-activity" data-private="">
+          {actLine}
+        </span>
+      )}
       {preview && <span className="task-preview" data-testid="task-preview" data-private="">{preview}</span>}
     </div>
   );

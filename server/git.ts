@@ -1,5 +1,5 @@
-import { execFile } from 'node:child_process';
 import type { GitInfo } from '../shared/protocol.ts';
+import { readGitInfo } from './workspace.ts';
 
 // Output of `git status --porcelain=v2 --branch`. null when there is no branch header (garbage / empty).
 export function parseGitStatus(out: string): GitInfo | null {
@@ -20,19 +20,16 @@ export function parseGitStatus(out: string): GitInfo | null {
 let warnedMissing = false;
 
 // null when dir is not a git repo, git is missing, it times out or fails: never throws.
-// --no-optional-locks: agents run git in the same repos, and a status refresh must never take index.lock.
-export function gitInfo(dir: string): Promise<GitInfo | null> {
-  return new Promise(resolve => {
-    execFile('git', ['--no-optional-locks', 'status', '--porcelain=v2', '--branch'],
-      { cwd: dir, windowsHide: true, timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
-        if (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT' && !warnedMissing) {
-            warnedMissing = true;
-            console.warn('[git] 找不到 git，侧栏不显示分支');
-          }
-          return resolve(null);
-        }
-        resolve(parseGitStatus(stdout));
-      });
-  });
+// Reuses workspace porcelain snapshot (--no-optional-locks, -z, --untracked-files=all) so sidebar dirty counts match Inspector 100%.
+export async function gitInfo(dir: string): Promise<GitInfo | null> {
+  try {
+    const res = await readGitInfo(dir);
+    if (res.enoent && !warnedMissing) {
+      warnedMissing = true;
+      console.warn('[git] 找不到 git，侧栏不显示分支');
+    }
+    return res.git;
+  } catch {
+    return null;
+  }
 }

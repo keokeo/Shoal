@@ -8,6 +8,13 @@ import type {
 export const MAX_TEXT_BYTES = 2 * 1024 * 1024; // 2 MB guard for editor & diff
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024; // 25 MB guard for inline image preview
 export const MAX_FILE_SEARCH = 20_000;
+export const MAX_CHANGED_FILES = 20_000;
+export const MAX_UNTRACKED_LINE_STAT = 200;
+
+const PORCELAIN_CACHE_TTL_MS = 250;
+const LINE_STAT_CONCURRENCY = 16;
+const PATH_COLLATOR = new Intl.Collator('en', { sensitivity: 'base' });
+const NAME_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
 
 const IMAGE_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -109,17 +116,33 @@ export function resolveProjectPath(
   return { realRoot, absPath, relPosix: toPosix(rel) };
 }
 
-function runGitBuf(cwd: string, args: string[], timeout = 8000): Promise<{ ok: boolean; stdout: Buffer; stderr: string }> {
+interface GitBufResult {
+  ok: boolean;
+  stdout: Buffer;
+  stderr: string;
+  timedOut: boolean;
+  code: number | string | null;
+}
+
+function runGitBuf(cwd: string, args: string[], timeout = 12_000): Promise<GitBufResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
       ['--no-optional-locks', ...args],
-      { cwd, encoding: 'buffer', windowsHide: true, timeout, maxBuffer: 32 * 1024 * 1024 },
+      { cwd, encoding: 'buffer', windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout, stderr) => {
+        const e = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: string }) | null;
+        const timedOut = !!e && (
+          e.killed === true
+          || e.code === 'ETIMEDOUT'
+          || e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+        );
         resolve({
           ok: !err,
           stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? ''),
           stderr: Buffer.isBuffer(stderr) ? stderr.toString('utf8') : String(stderr ?? ''),
+          timedOut,
+          code: e?.code ?? 0,
         });
       },
     );
@@ -136,10 +159,20 @@ function classifyStatus(xy: string): ChangeStatus {
   return 'M';
 }
 
+const STATUS_PRIORITY: Record<ChangeStatus, number> = { U: 6, D: 5, M: 4, A: 3, R: 2, '?': 1 };
+
+export interface ParsedPorcelainItem {
+  path: string;
+  origPath?: string;
+  status: ChangeStatus;
+  isSubmodule?: boolean;
+  isDirHint?: boolean;
+}
+
 interface ParsedPorcelain {
   git: GitInfo | null;
   initial: boolean;
-  items: { path: string; origPath?: string; status: ChangeStatus }[];
+  items: ParsedPorcelainItem[];
 }
 
 export function parsePorcelainZ(buf: Buffer): ParsedPorcelain {
@@ -147,7 +180,37 @@ export function parsePorcelainZ(buf: Buffer): ParsedPorcelain {
   const tokens = text.split('\0');
   let head: string | undefined;
   let oid = '';
-  const items: ParsedPorcelain['items'] = [];
+  const byPath = new Map<string, ParsedPorcelainItem>();
+
+  const mergeItem = (next: ParsedPorcelainItem) => {
+    if (!next.path) return;
+    const prev = byPath.get(next.path);
+    if (!prev) {
+      byPath.set(next.path, next);
+      return;
+    }
+    // Same path deleted in index/worktree and recreated as untracked -> treat as modified without duplicate keys
+    if ((prev.status === 'D' && next.status === '?') || (prev.status === '?' && next.status === 'D')) {
+      const origPath = prev.origPath ?? next.origPath;
+      byPath.set(next.path, {
+        path: next.path,
+        status: 'M',
+        ...(origPath ? { origPath } : {}),
+        ...((prev.isSubmodule || next.isSubmodule) ? { isSubmodule: true } : {}),
+        ...((prev.isDirHint || next.isDirHint) ? { isDirHint: true } : {}),
+      });
+      return;
+    }
+    const keepNext = STATUS_PRIORITY[next.status] >= STATUS_PRIORITY[prev.status];
+    const origPath = keepNext ? (next.origPath ?? prev.origPath) : (prev.origPath ?? next.origPath);
+    byPath.set(next.path, {
+      path: next.path,
+      status: keepNext ? next.status : prev.status,
+      ...(origPath ? { origPath } : {}),
+      ...((prev.isSubmodule || next.isSubmodule) ? { isSubmodule: true } : {}),
+      ...((prev.isDirHint || next.isDirHint) ? { isDirHint: true } : {}),
+    });
+  };
 
   for (let i = 0; i < tokens.length; i++) {
     const rec = tokens[i];
@@ -159,24 +222,37 @@ export function parsePorcelainZ(buf: Buffer): ParsedPorcelain {
     }
     const kind = rec[0];
     if (kind === '?' && rec[1] === ' ') {
-      items.push({ path: rec.slice(2), status: '?' });
+      const rawPath = rec.slice(2);
+      const isDirHint = rawPath.endsWith('/');
+      const cleanPath = isDirHint ? rawPath.slice(0, -1) : rawPath;
+      mergeItem({ path: cleanPath, status: '?', ...(isDirHint ? { isDirHint: true } : {}) });
     } else if (kind === '1' && rec[1] === ' ') {
       // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
-      const m = rec.match(/^1 (\S+) \S+ \S+ \S+ \S+ \S+ \S+ ([\s\S]+)$/);
-      if (m) items.push({ path: m[2], status: classifyStatus(m[1]) });
+      const m = rec.match(/^1 (\S+) (\S+) (\S+) (\S+) (\S+) \S+ \S+ ([\s\S]+)$/);
+      if (m) {
+        const isSubmodule = m[2].startsWith('S') || m[3] === '160000' || m[4] === '160000' || m[5] === '160000';
+        mergeItem({ path: m[6], status: classifyStatus(m[1]), ...(isSubmodule ? { isSubmodule: true } : {}) });
+      }
     } else if (kind === '2' && rec[1] === ' ') {
       // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <Xscore> <path>\0<origPath>
-      const m = rec.match(/^2 (\S+) \S+ \S+ \S+ \S+ \S+ \S+ \S+ ([\s\S]+)$/);
+      const m = rec.match(/^2 (\S+) (\S+) (\S+) (\S+) (\S+) \S+ \S+ \S+ ([\s\S]+)$/);
       const origPath = tokens[++i] ?? undefined;
-      if (m) items.push({ path: m[2], origPath, status: classifyStatus(m[1]) });
+      if (m) {
+        const isSubmodule = m[2].startsWith('S') || m[3] === '160000' || m[4] === '160000' || m[5] === '160000';
+        mergeItem({ path: m[6], origPath, status: classifyStatus(m[1]), ...(isSubmodule ? { isSubmodule: true } : {}) });
+      }
     } else if (kind === 'u' && rec[1] === ' ') {
       // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
-      const m = rec.match(/^u (\S+) \S+ \S+ \S+ \S+ \S+ \S+ \S+ \S+ ([\s\S]+)$/);
-      if (m) items.push({ path: m[2], status: 'U' });
+      const m = rec.match(/^u (\S+) (\S+) \S+ \S+ \S+ (\S+) \S+ \S+ \S+ ([\s\S]+)$/);
+      if (m) {
+        const isSubmodule = m[2].startsWith('S') || m[3] === '160000';
+        mergeItem({ path: m[4], status: 'U', ...(isSubmodule ? { isSubmodule: true } : {}) });
+      }
     }
   }
 
   if (!head) return { git: null, initial: false, items: [] };
+  const items = [...byPath.values()];
   const initial = oid === '(initial)';
   const git: GitInfo = head === '(detached)'
     ? { branch: oid && !initial ? oid.slice(0, 7) : 'HEAD', detached: true, dirty: items.length }
@@ -228,12 +304,12 @@ function isBinaryBuffer(buf: Buffer): boolean {
   return false;
 }
 
-function countLinesQuick(absPath: string): number | null {
+async function countLinesAsync(absPath: string): Promise<number | null> {
   try {
-    const st = fs.statSync(absPath);
+    const st = await fs.promises.stat(absPath);
     if (!st.isFile() || st.size > 512 * 1024) return null;
     if (st.size === 0) return 0;
-    const buf = fs.readFileSync(absPath);
+    const buf = await fs.promises.readFile(absPath);
     if (isBinaryBuffer(buf)) return null;
     let lines = 0;
     for (let i = 0; i < buf.length; i++) if (buf[i] === 10) lines++;
@@ -244,16 +320,145 @@ function countLinesQuick(absPath: string): number | null {
   }
 }
 
-export async function listChanges(projectDir: string): Promise<ProjectChanges> {
-  const { realRoot } = resolveProjectPath(projectDir, '', { allowRoot: true });
-  const st = await runGitBuf(realRoot, ['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all']);
-  if (!st.ok) return { git: null, files: [] };
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+interface PorcelainSnapshot {
+  git: GitInfo | null;
+  initial: boolean;
+  items: ParsedPorcelainItem[];
+  fileStatus: Map<string, ChangeStatus>;
+  dirStatus: Map<string, ChangeStatus>;
+  timedOut: boolean;
+  errorCode: number | string | null;
+}
+
+const inFlightPorcelain = new Map<string, Promise<PorcelainSnapshot>>();
+const recentPorcelain = new Map<string, { at: number; data: PorcelainSnapshot }>();
+const inFlightChanges = new Map<string, Promise<ProjectChanges>>();
+
+export function invalidateProjectGitCache(projectDir: string): void {
+  try {
+    const realRoot = fs.realpathSync.native(projectDir);
+    recentPorcelain.delete(realRoot);
+  } catch {
+    // ignore missing dir
+  }
+}
+
+function buildPorcelainSnapshot(st: GitBufResult): PorcelainSnapshot {
+  if (!st.ok) {
+    return {
+      git: null,
+      initial: false,
+      items: [],
+      fileStatus: new Map(),
+      dirStatus: new Map(),
+      timedOut: st.timedOut,
+      errorCode: st.code,
+    };
+  }
   const parsed = parsePorcelainZ(st.stdout);
-  if (!parsed.git) return { git: null, files: [] };
+  const fileStatus = new Map<string, ChangeStatus>();
+  const dirStatus = new Map<string, ChangeStatus>();
+  if (parsed.git) {
+    for (const item of parsed.items) {
+      fileStatus.set(item.path, item.status);
+      if (item.isDirHint || item.isSubmodule) {
+        const curSelf = dirStatus.get(item.path);
+        if (!curSelf || STATUS_PRIORITY[item.status] > STATUS_PRIORITY[curSelf]) {
+          dirStatus.set(item.path, item.status);
+        }
+      }
+      let pos = item.path.indexOf('/');
+      while (pos !== -1) {
+        const dirPath = item.path.slice(0, pos);
+        const cur = dirStatus.get(dirPath);
+        if (!cur || STATUS_PRIORITY[item.status] > STATUS_PRIORITY[cur]) {
+          dirStatus.set(dirPath, item.status);
+        }
+        pos = item.path.indexOf('/', pos + 1);
+      }
+    }
+  }
+  return {
+    git: parsed.git,
+    initial: parsed.initial,
+    items: parsed.items,
+    fileStatus,
+    dirStatus,
+    timedOut: false,
+    errorCode: 0,
+  };
+}
+
+async function getPorcelainSnapshot(realRoot: string, opts: { bypassCache?: boolean } = {}): Promise<PorcelainSnapshot> {
+  if (!opts.bypassCache) {
+    const cached = recentPorcelain.get(realRoot);
+    if (cached && Date.now() - cached.at < PORCELAIN_CACHE_TTL_MS) {
+      return cached.data;
+    }
+  }
+  const existing = inFlightPorcelain.get(realRoot);
+  if (existing) return existing;
+
+  const p = (async () => {
+    const st = await runGitBuf(realRoot, ['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all']);
+    const snap = buildPorcelainSnapshot(st);
+    if (!snap.timedOut && snap.errorCode !== 'ENOENT') {
+      recentPorcelain.set(realRoot, { at: Date.now(), data: snap });
+    }
+    return snap;
+  })().finally(() => {
+    inFlightPorcelain.delete(realRoot);
+  });
+
+  inFlightPorcelain.set(realRoot, p);
+  return p;
+}
+
+export async function readGitInfo(projectDir: string): Promise<{ git: GitInfo | null; enoent: boolean }> {
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync.native(projectDir);
+  } catch {
+    return { git: null, enoent: false };
+  }
+  const snap = await getPorcelainSnapshot(realRoot);
+  return {
+    git: snap.timedOut ? null : snap.git,
+    enoent: snap.errorCode === 'ENOENT',
+  };
+}
+
+async function computeChanges(realRoot: string): Promise<ProjectChanges> {
+  const snap = await getPorcelainSnapshot(realRoot);
+  if (snap.timedOut) {
+    throw new WorkspaceError(504, 'Git 状态扫描超时，项目内未忽略文件过多');
+  }
+  if (!snap.git) return { git: null, files: [] };
+
+  const sortedItems = [...snap.items].sort((a, b) => PATH_COLLATOR.compare(a.path, b.path));
+  const truncated = sortedItems.length > MAX_CHANGED_FILES;
+  const targetItems = truncated ? sortedItems.slice(0, MAX_CHANGED_FILES) : sortedItems;
 
   const stats = new Map<string, { added: number | null; deleted: number | null }>();
-  if (parsed.items.length > 0) {
-    if (!parsed.initial) {
+  if (targetItems.length > 0) {
+    if (!snap.initial) {
       const ns = await runGitBuf(realRoot, ['diff', 'HEAD', '--numstat', '-z']);
       if (ns.ok) for (const [k, v] of parseNumstatZ(ns.stdout)) stats.set(k, v);
     } else {
@@ -275,18 +480,58 @@ export async function listChanges(projectDir: string): Promise<ProjectChanges> {
     }
   }
 
-  const files: ChangedFile[] = parsed.items.map((it) => {
-    const num = stats.get(it.path);
-    if (num) return { ...it, added: num.added, deleted: num.deleted };
-    if (it.status === '?' || it.status === 'A') {
-      const lines = countLinesQuick(path.join(realRoot, it.path));
-      return { ...it, added: lines, deleted: lines === null ? null : 0 };
+  const statNeededIndices: number[] = [];
+  for (let i = 0; i < targetItems.length; i++) {
+    const it = targetItems[i];
+    if (!stats.has(it.path) && (it.status === '?' || it.status === 'A') && !it.isDirHint && !it.isSubmodule) {
+      statNeededIndices.push(i);
     }
-    return { ...it, added: null, deleted: null };
+  }
+  const statsSkipped = statNeededIndices.length > MAX_UNTRACKED_LINE_STAT;
+
+  const extraLines = new Map<number, number | null>();
+  if (!statsSkipped && statNeededIndices.length > 0) {
+    const counts = await mapWithConcurrency(
+      statNeededIndices,
+      LINE_STAT_CONCURRENCY,
+      (idx) => countLinesAsync(path.join(realRoot, targetItems[idx].path)),
+    );
+    for (let i = 0; i < statNeededIndices.length; i++) {
+      extraLines.set(statNeededIndices[i], counts[i]);
+    }
+  }
+
+  const files: ChangedFile[] = targetItems.map((it, idx) => {
+    const baseItem = it.origPath
+      ? { path: it.path, origPath: it.origPath, status: it.status }
+      : { path: it.path, status: it.status };
+    const num = stats.get(it.path);
+    if (num) return { ...baseItem, added: num.added, deleted: num.deleted };
+    if (extraLines.has(idx)) {
+      const lines = extraLines.get(idx) ?? null;
+      return { ...baseItem, added: lines, deleted: lines === null ? null : 0 };
+    }
+    return { ...baseItem, added: null, deleted: null };
   });
 
-  files.sort((a, b) => a.path.localeCompare(b.path, 'en', { sensitivity: 'base' }));
-  return { git: parsed.git, files };
+  return {
+    git: snap.git,
+    files,
+    ...(truncated ? { truncated: true } : {}),
+    ...(statsSkipped ? { statsSkipped: true } : {}),
+  };
+}
+
+export async function listChanges(projectDir: string): Promise<ProjectChanges> {
+  const { realRoot } = resolveProjectPath(projectDir, '', { allowRoot: true });
+  const existing = inFlightChanges.get(realRoot);
+  if (existing) return existing;
+
+  const p = computeChanges(realRoot).finally(() => {
+    inFlightChanges.delete(realRoot);
+  });
+  inFlightChanges.set(realRoot, p);
+  return p;
 }
 
 export async function readDiff(projectDir: string, rawRelPath: string): Promise<DiffPayload> {
@@ -295,6 +540,7 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
   let status: ChangeStatus | null = null;
   let origPosix: string | undefined;
   let initial = false;
+  let isSubmoduleOrDir = false;
   if (stRes.ok) {
     const parsed = parsePorcelainZ(stRes.stdout);
     initial = parsed.initial;
@@ -302,6 +548,7 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
     if (hit) {
       status = hit.status;
       origPosix = hit.origPath;
+      isSubmoduleOrDir = !!(hit.isSubmodule || hit.isDirHint);
     }
   }
 
@@ -309,14 +556,22 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
   let size = 0;
   let mtimeMs: number | null = null;
   try {
-    const fst = fs.statSync(absPath);
-    if (fst.isFile()) {
+    const fst = await fs.promises.stat(absPath);
+    if (fst.isDirectory()) {
+      isSubmoduleOrDir = true;
+    } else if (fst.isFile()) {
       size = fst.size;
       mtimeMs = fst.mtimeMs;
-      if (size <= MAX_TEXT_BYTES) diskBuf = fs.readFileSync(absPath);
+      if (!isSubmoduleOrDir && size <= MAX_TEXT_BYTES) {
+        diskBuf = await fs.promises.readFile(absPath);
+      }
     }
   } catch {
     // Missing in worktree (e.g. status === 'D')
+  }
+
+  if (isSubmoduleOrDir) {
+    return { path: relPosix, status, base: '', head: '', binary: false, tooLarge: false, isDirectory: true, size: 0, mtimeMs: null };
   }
 
   if (size > MAX_TEXT_BYTES) {
@@ -465,6 +720,7 @@ export function writeFileEntry(projectDir: string, body: Partial<WriteFileBody>)
   fs.mkdirSync(path.dirname(absPath), { recursive: true });
   fs.writeFileSync(absPath, buf);
   const after = fs.statSync(absPath);
+  invalidateProjectGitCache(projectDir);
   return { path: relPosix, size: after.size, mtimeMs: after.mtimeMs };
 }
 
@@ -477,50 +733,52 @@ export async function discardFile(projectDir: string, rawRelPath: string): Promi
   const hit = parsed.items.find((x) => x.path === relPosix) ?? parsed.items[0];
   if (!hit) return; // already clean
 
-  if (hit.status === '?') {
-    let fst: fs.Stats | null = null;
-    try { fst = fs.lstatSync(absPath); } catch { fst = null; }
-    if (fst && fst.isDirectory() && !fst.isSymbolicLink()) {
-      throw new WorkspaceError(400, '不支持整目录删除');
+  try {
+    if (hit.status === '?') {
+      let fst: fs.Stats | null = null;
+      try { fst = fs.lstatSync(absPath); } catch { fst = null; }
+      if (fst && fst.isDirectory() && !fst.isSymbolicLink()) {
+        throw new WorkspaceError(400, '不支持整目录删除');
+      }
+      fs.rmSync(absPath, { force: true });
+      return;
     }
-    fs.rmSync(absPath, { force: true });
-    return;
-  }
 
-  if (parsed.initial) {
-    // Unborn HEAD: remove from index and remove working copy if it was staged-added
-    await runGitBuf(realRoot, ['rm', '-f', '--', relPosix]);
-    fs.rmSync(absPath, { force: true });
-    return;
-  }
-
-  // Check if the path existed in HEAD
-  const inHead = await runGitBuf(realRoot, ['cat-file', '-e', `HEAD:${relPosix}`]);
-  if (!inHead.ok) {
-    // Added to index (and maybe renamed from origPath)
-    await runGitBuf(realRoot, ['rm', '-f', '--', relPosix]);
-    fs.rmSync(absPath, { force: true });
-    if (hit.origPath) {
-      // Guard origPath containment too
-      resolveProjectPath(projectDir, hit.origPath);
-      await runGitBuf(realRoot, ['checkout', 'HEAD', '--', hit.origPath]);
+    if (parsed.initial) {
+      // Unborn HEAD: remove from index and remove working copy if it was staged-added
+      await runGitBuf(realRoot, ['rm', '-f', '--', relPosix]);
+      fs.rmSync(absPath, { force: true });
+      return;
     }
-    return;
-  }
 
-  const co = await runGitBuf(realRoot, ['checkout', 'HEAD', '--', relPosix]);
-  if (!co.ok) {
-    throw new WorkspaceError(500, `放弃改动失败：${co.stderr.trim() || 'git checkout 失败'}`);
+    // Check if the path existed in HEAD
+    const inHead = await runGitBuf(realRoot, ['cat-file', '-e', `HEAD:${relPosix}`]);
+    if (!inHead.ok) {
+      // Added to index (and maybe renamed from origPath)
+      await runGitBuf(realRoot, ['rm', '-f', '--', relPosix]);
+      fs.rmSync(absPath, { force: true });
+      if (hit.origPath) {
+        // Guard origPath containment too
+        resolveProjectPath(projectDir, hit.origPath);
+        await runGitBuf(realRoot, ['checkout', 'HEAD', '--', hit.origPath]);
+      }
+      return;
+    }
+
+    const co = await runGitBuf(realRoot, ['checkout', 'HEAD', '--', relPosix]);
+    if (!co.ok) {
+      throw new WorkspaceError(500, `放弃改动失败：${co.stderr.trim() || 'git checkout 失败'}`);
+    }
+  } finally {
+    recentPorcelain.delete(realRoot);
   }
 }
-
-const STATUS_PRIORITY: Record<ChangeStatus, number> = { U: 6, D: 5, M: 4, A: 3, R: 2, '?': 1 };
 
 export async function listTree(projectDir: string, rawRelDir = ''): Promise<TreeListing> {
   const { realRoot, absPath, relPosix } = resolveProjectPath(projectDir, rawRelDir, { allowRoot: true });
   let fst: fs.Stats;
   try {
-    fst = fs.statSync(absPath);
+    fst = await fs.promises.stat(absPath);
   } catch {
     throw new WorkspaceError(404, `目录不存在：${relPosix || '.'}`);
   }
@@ -528,76 +786,50 @@ export async function listTree(projectDir: string, rawRelDir = ''): Promise<Tree
 
   let dirents: fs.Dirent[];
   try {
-    dirents = fs.readdirSync(absPath, { withFileTypes: true });
+    dirents = await fs.promises.readdir(absPath, { withFileTypes: true });
   } catch {
     throw new WorkspaceError(400, `无法读取目录：${relPosix || '.'}`);
   }
 
-  // Collect dirty markers under this directory (fast even on medium repos; non-blocking if not a git repo)
-  const fileStatus = new Map<string, ChangeStatus>();
-  const dirStatus = new Map<string, ChangeStatus>();
+  // Reuse project-level porcelain cache (O(1) lookup, 0 extra git spawns on expand)
+  const snap = await getPorcelainSnapshot(realRoot);
   const prefix = relPosix ? relPosix + '/' : '';
-  const stRes = await runGitBuf(
-    realRoot,
-    relPosix ? ['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all', '--', relPosix] : ['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all'],
-  );
-  if (stRes.ok) {
-    const parsed = parsePorcelainZ(stRes.stdout);
-    for (const item of parsed.items) {
-      if (prefix && !item.path.startsWith(prefix)) continue;
-      const rest = prefix ? item.path.slice(prefix.length) : item.path;
-      if (!rest) continue;
-      const slash = rest.indexOf('/');
-      if (slash === -1) {
-        fileStatus.set(rest, item.status);
-      } else {
-        const childDir = rest.slice(0, slash);
-        const cur = dirStatus.get(childDir);
-        if (!cur || STATUS_PRIORITY[item.status] > STATUS_PRIORITY[cur]) {
-          dirStatus.set(childDir, item.status);
-        }
-      }
-    }
-  }
 
   const entries: TreeEntry[] = [];
   for (const d of dirents) {
     if (d.name === '.git') continue; // hide internal git object store
-    const full = path.join(absPath, d.name);
     let isDir = d.isDirectory();
     let isFile = d.isFile();
-    let size: number | undefined;
     if (d.isSymbolicLink()) {
       try {
-        const real = fs.realpathSync.native(full);
+        const full = path.join(absPath, d.name);
+        const real = await fs.promises.realpath(full);
         if (!isInsideRoot(realRoot, real)) continue; // hide external symlinks
-        const lst = fs.statSync(real);
+        const lst = await fs.promises.stat(real);
         isDir = lst.isDirectory();
         isFile = lst.isFile();
-        if (isFile) size = lst.size;
       } catch {
         continue; // broken symlink
       }
-    } else if (isFile) {
-      try { size = fs.statSync(full).size; } catch { /* ignore */ }
     }
     if (!isDir && !isFile) continue;
     const entryPath = prefix + d.name;
     if (isDir) {
+      const st = snap.dirStatus.get(entryPath);
       entries.push({
         name: d.name,
         path: entryPath,
         kind: 'dir',
         ...(HEAVY_DIRS.has(d.name) && { ignored: true }),
-        ...(dirStatus.get(d.name) && { gitStatus: dirStatus.get(d.name) }),
+        ...(st && { gitStatus: st }),
       });
     } else {
+      const st = snap.fileStatus.get(entryPath);
       entries.push({
         name: d.name,
         path: entryPath,
         kind: 'file',
-        ...(fileStatus.get(d.name) && { gitStatus: fileStatus.get(d.name) }),
-        ...(size !== undefined && { size }),
+        ...(st && { gitStatus: st }),
       });
     }
   }
@@ -606,7 +838,7 @@ export async function listTree(projectDir: string, rawRelDir = ''): Promise<Tree
     if (a.kind !== b.kind) return a.kind === 'dir' ? -1 : 1;
     // Put non-ignored dirs ahead of heavy ignored dirs (like node_modules) so source dirs sit at the top
     if (a.kind === 'dir' && !!a.ignored !== !!b.ignored) return a.ignored ? 1 : -1;
-    return a.name.localeCompare(b.name, 'en', { numeric: true, sensitivity: 'base' });
+    return NAME_COLLATOR.compare(a.name, b.name);
   });
 
   return { path: relPosix, entries };
@@ -624,7 +856,7 @@ export async function listAllFiles(projectDir: string): Promise<FileListResult> 
     // Also surface root .env* files that are commonly gitignored so Ctrl+P can find .env!
     const seen = new Set(raw);
     try {
-      for (const d of fs.readdirSync(realRoot, { withFileTypes: true })) {
+      for (const d of await fs.promises.readdir(realRoot, { withFileTypes: true })) {
         if (d.isFile() && d.name.startsWith('.env') && !seen.has(d.name)) {
           raw.push(d.name);
           seen.add(d.name);
@@ -633,7 +865,7 @@ export async function listAllFiles(projectDir: string): Promise<FileListResult> 
     } catch { /* ignore */ }
     const truncated = raw.length > MAX_FILE_SEARCH;
     const existing = truncated ? raw.slice(0, MAX_FILE_SEARCH) : raw;
-    existing.sort((a, b) => a.localeCompare(b, 'en', { numeric: true, sensitivity: 'base' }));
+    existing.sort((a, b) => NAME_COLLATOR.compare(a, b));
     return { files: existing, truncated };
   }
 
@@ -665,6 +897,6 @@ export async function listAllFiles(projectDir: string): Promise<FileListResult> 
     }
   };
   walk(realRoot, '');
-  files.sort((a, b) => a.localeCompare(b, 'en', { numeric: true, sensitivity: 'base' }));
+  files.sort((a, b) => NAME_COLLATOR.compare(a, b));
   return { files, truncated };
 }

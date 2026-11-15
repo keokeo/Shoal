@@ -88,19 +88,25 @@ async function post(status) {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
     body: JSON.stringify({ sessionId, agent, event: 'RateLimits', at: Date.now(), payload }),
-    signal: AbortSignal.timeout(2000),
+    signal: AbortSignal.timeout(450),
   });
   if (res.ok) fs.writeFileSync(cache, sig);
 }
 
-let printed = '';
+let flushed = false;
 try {
   const raw = await readStdin();
   let status = null;
   try { status = raw ? JSON.parse(raw) : null; } catch { /* not JSON: nothing to report */ }
-  const [out] = await Promise.all([runUser(raw), post(status).catch(err => process.stderr.write(`[workbench-statusline] ${err?.message ?? err}\n`))]);
-  printed = out;
+  const postPromise = post(status).catch(err => process.stderr.write(`[workbench-statusline] ${err?.message ?? err}\n`));
+  const out = await runUser(raw);
+  if (out) {
+    process.stdout.write(out);
+    flushed = true;
+  }
+  await postPromise;
 } catch (err) {
   process.stderr.write(`[workbench-statusline] ${err?.message ?? err}\n`);
 }
-process.stdout.write(printed, () => process.exit(0));
+if (flushed) process.stdout.write('', () => process.exit(0));
+else process.exit(0);

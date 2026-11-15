@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-本机多 agent 工作台：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、agy 的原生交互式会话（node-pty + ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）与 [docs/inspector-spec.md](docs/inspector-spec.md)。
+本机多 agent 工作台：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、agy 的原生交互式会话（node-pty + ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）、[docs/inspector-spec.md](docs/inspector-spec.md) 与 [docs/collab-spec.md](docs/collab-spec.md)。
 
 > [!WARNING]
 > 三家 CLI 都以完全权限启动（跳过审批，codex 关闭沙箱），agent 可以直接改文件、跑命令。只在你信任的项目目录里使用，详见下文「权限」。
@@ -102,7 +102,10 @@ build-desktop.cmd       # 同样的构建，先升版本号：默认 patch，也
 - 实时订阅额度：顶栏和当前面板标题栏（agent 标识旁）显示各家订阅的窗口已用比例（如 `5h 48% · 7d 6%`），悬停可看精确重置时间与倒计时；已用 ≥ 80% 变琥珀色，100% 加粗，窗口到点后自动消失，最新数据持久化在 `<stateDir>/quota.json`。Claude Code 与 agy（Antigravity / Gemini 订阅）通过各自的 `statusLine` 实时上报（如果你自己配了 `statusLine`，工作台的中继脚本会原样继续执行你的状态栏；agy 默认叠加保留原生状态栏），Codex 在每轮结束时从对话记录读取。
 - 额度用完：claude 报额度用完（rate limit / billing，或回复 “You've hit your … limit”）时，这一轮不生成结果卡片，面板顶部出现额度横条，侧栏显示「额度用完」。codex 和 agy 还没有额度用完的样本，不会自动识别，需要时手动换 agent。
 - 换 agent：面板标题栏的「换 agent」或额度横条上的按钮。选接手的 CLI，可写补充说明，提交（`Ctrl+Enter`）后工作台用接手的 CLI 跑一次 headless 短调用（几秒到二十几秒，会用少量额度），读任务需求、结果和反馈卡片、旧会话的对话记录，写出交接卡片；然后在原面板用新 CLI 开新会话，第一条消息是交接卡片、你的补充和旧对话记录的路径。生成失败时改用按记录摘录的兜底卡片，并提示“已按记录摘录”。面板顶部的「交接」细条点「展开」会以浮层展示卡片全文，不改变终端高度。
-- 转发：点开面板标题栏通过按钮旁的下拉菜单，选「转发结果…」把这张结果卡片发给另一个任务或新建的任务。弹窗里可以写附言（不写就用默认附言），并预览将发送的完整内容。发给已有任务时排队投递：目标正在工作、有权限提示、你 5 秒内在那个会话里打过字，或者它一轮刚结束不到 1.5 秒时，终端右上角浮出“消息排队中”，侧栏该任务显示「排队」，直到发出；目标会话已退出时先续接，续接不了会提示改为转发到新任务。转发不改变源任务的状态。
+- 转发：点开面板标题栏通过按钮旁的下拉菜单，选「转发结果…」把这张结果卡片发给另一个任务或新建的任务。弹窗里可以写附言（不写就用默认附言）、预览将发送的完整内容，也可按需勾选「对方本轮完成后，自动把结果传回当前任务」（精确单次回传，不会修改普通对话窗口布局）。发给已有任务时排队投递：目标正在工作、有权限提示、启动信任弹窗、你正在输入草稿/5 秒内打过字或刚按了 `Ctrl+C`，以及它一轮刚结束不到 1.5 秒时，终端右上角浮出“消息排队中”，侧栏该任务显示「排队」，直到安全空闲时再发出；目标会话已退出时先续接，续接不了会提示改为转发到新任务。转发不改变源任务的状态。
+- 跨 CLI 轻量协作（详见 [docs/collab-spec.md](docs/collab-spec.md)）：
+  - **同项目静默黑板**：每次主会话结束会自动把最新回复同步到 `<stateDir>/collab/<projectId>/PEERS.md` 与 `turns/<taskId>-latest.md`（并注入 `WORKBENCH_PEERS_FILE`；`agy` 会额外通过 `--add-dir` 获得所属项目黑板的只读/读写路径），任意会话都可直接按需阅读隔壁进度而零打扰。
+  - **终端内 `shoal` 命令**：工作台会为会话静默注入 `<stateDir>/bin`（`shoal.cmd` / `shoal`）与会话令牌，支持 `shoal peers`、`shoal send <target> ...` 与 `shoal ask <target> ...`（异步请求并在对方本轮完成后自动回传 1 次，带 4 跳防循环熔断；配套按需技能位于 `skills/shoal-collab/SKILL.md`）。
 
 ## 测试
 

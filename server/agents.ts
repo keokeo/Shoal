@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import type { AgentKind } from '../shared/protocol.ts';
+import { isValidAgyModel } from '../shared/protocol.ts';
 
 // Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
 // 8.3 short form when the volume has one. Shorten only the directory when the filename has no spaces: `%~sI` on a >8-char
@@ -273,8 +274,44 @@ export function availableAgents(): AgentKind[] {
   return out;
 }
 
-// Writes the per-agent hook config files into the state dir (idempotent).
+// Writes the per-agent hook config files and shoal CLI shims into the state dir (idempotent).
 export function writeHookFiles(stateDir: string): void {
+  const binDir = path.join(stateDir, 'bin');
+  const collabDir = path.join(stateDir, 'collab');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(collabDir, { recursive: true });
+
+  const cliSrc = path.join(ROOT, 'hooks', 'shoal-cli.mjs');
+  if (fs.existsSync(cliSrc)) {
+    fs.copyFileSync(cliSrc, path.join(binDir, 'shoal-cli.mjs'));
+  }
+  const shoalCmd = [
+    '@echo off',
+    'if defined WORKBENCH_NODE (',
+    '  "%WORKBENCH_NODE%" "%~dp0shoal-cli.mjs" %*',
+    ') else (',
+    '  node "%~dp0shoal-cli.mjs" %*',
+    ')',
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(path.join(binDir, 'shoal.cmd'), shoalCmd, 'utf8');
+
+  // Strict LF line endings so Git Bash / POSIX shells execute without '\r' errors.
+  const shoalSh = [
+    '#!/bin/sh',
+    'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+    'if [ -n "$WORKBENCH_NODE" ]; then',
+    '  exec "$WORKBENCH_NODE" "$DIR/shoal-cli.mjs" "$@"',
+    'fi',
+    'exec node "$DIR/shoal-cli.mjs" "$@"',
+    '',
+  ].join('\n');
+  const shFile = path.join(binDir, 'shoal');
+  fs.writeFileSync(shFile, shoalSh, 'utf8');
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(shFile, 0o755); } catch { /* ignore */ }
+  }
+
   const hooks: Record<string, unknown> = {};
   for (const ev of CLAUDE_EVENTS) hooks[ev] = [{ hooks: [{ type: 'command', command: hookCmd('claude', ev), timeout: 5 }] }];
   // Claude reports its subscription rate limits only to the status line command. This one replaces the user's own
@@ -291,6 +328,12 @@ export function writeHookFiles(stateDir: string): void {
   const dir = path.join(stateDir, 'agy-hooks', '.agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ workbench: agy }, null, 2));
+  const skillSrc = path.join(ROOT, 'skills', 'shoal-collab', 'SKILL.md');
+  if (fs.existsSync(skillSrc)) {
+    const skillDst = path.join(dir, 'skills', 'shoal-collab', 'SKILL.md');
+    fs.mkdirSync(path.dirname(skillDst), { recursive: true });
+    fs.copyFileSync(skillSrc, skillDst);
+  }
   const agySl = agyUserStatusLine();
   const agyStatusLine = {
     type: 'command',
@@ -328,8 +371,16 @@ export const FULL_ACCESS = {
 } as const;
 
 // resume: native session id of a saved conversation to reopen (resume commands verified in M0); the prompt is ignored then.
-export function buildLaunch(opts: { agent: AgentKind; sessionId: string; prompt: string; stateDir: string; resume?: string }): Launch {
-  const { agent, sessionId, stateDir, resume } = opts;
+export function buildLaunch(opts: {
+  agent: AgentKind;
+  sessionId: string;
+  prompt: string;
+  stateDir: string;
+  resume?: string;
+  model?: string;
+  collabDir?: string;
+}): Launch {
+  const { agent, sessionId, stateDir, resume, model, collabDir } = opts;
   const prompt = resume ? '' : preparePrompt(opts.prompt, sessionId, stateDir);
   switch (agent) {
     case 'claude': {
@@ -349,7 +400,13 @@ export function buildLaunch(opts: { agent: AgentKind; sessionId: string; prompt:
     }
     case 'agy': {
       const args = resume ? ['--conversation', resume] : [];
-      args.push('--settings', path.join(stateDir, 'agy-settings.json').replaceAll('\\', '/'), '--add-dir', path.join(stateDir, 'agy-hooks'), FULL_ACCESS.agy);
+      args.push('--settings', path.join(stateDir, 'agy-settings.json').replaceAll('\\', '/'), '--add-dir', path.join(stateDir, 'agy-hooks'));
+      if (collabDir) {
+        fs.mkdirSync(collabDir, { recursive: true });
+        args.push('--add-dir', collabDir);
+      }
+      args.push(FULL_ACCESS.agy);
+      if (model && isValidAgyModel(model)) args.push('--model', model);
       if (prompt) args.push('-i', prompt);
       return { file: agyExe(), args, nativeSessionId: resume ?? null };
     }

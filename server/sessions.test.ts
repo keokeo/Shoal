@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from './http.ts';
 import {
   agyHookDisposition, agyPrimaryWorkspaces, CODEX_NEWLINE, deliverable, isAgyIntermediateStop,
-  modePrefix, nativeIdUpdate, pasteFrame, sanitizePaste, SessionManager, trackModes,
+  isTerminalReportSequence, modePrefix, nativeIdUpdate, pasteFrame, prependEnvPath, sanitizePaste,
+  SessionManager, STARTUP_BLOCK_RE, stripAnsiForMatch, trackModes,
 } from './sessions.ts';
 import type { DeliveryState } from './sessions.ts';
 import { createFileStore } from './store.ts';
@@ -80,6 +81,112 @@ describe('deliverable', () => {
 
   it('becomes true exactly at the 5 s / 2 s / 1.5 s boundaries', () => {
     expect(deliverable({ ...base, lastInputAt: now - 5000, lastDeliveryAt: now - 2000, statusSince: now - 1500 }, now)).toBe(true);
+  });
+
+  it.each([
+    ['initialPromptPending', { initialPromptPending: true }],
+    ['startupBlocked', { startupBlocked: true }],
+    ['deliveringUntil in-flight lock', { deliveringUntil: now + 1 }],
+    ['hasDraft', { hasDraft: true }],
+    ['interruptedByUser', { interruptedByUser: true }],
+  ] as [string, Partial<DeliveryState>][])('is false for new PTY safety gates: %s', (_n, patch) => {
+    expect(deliverable({ ...base, ...patch }, now)).toBe(false);
+  });
+
+  it('unlocks once deliveringUntil expires', () => {
+    expect(deliverable({ ...base, deliveringUntil: now }, now)).toBe(true);
+  });
+});
+
+describe('PTY input guards & env Path normalization', () => {
+  it('filters xterm focus, mouse, CPR, DA, and OSC responses while keeping real keys', () => {
+    for (const seq of ['', '\x1b[I', '\x1b[O', '\x1b[I\x1b[O', '\x1b[<35;12;8M', '\x1b[<0;10;5m', '\x1b[12;40R', '\x1b[?62;22c', '\x1b]11;rgb:1111/1111/1111\x1b\\']) {
+      expect(isTerminalReportSequence(seq)).toBe(true);
+    }
+    for (const real of ['a', '\r', '\x03', '\x1b', '\x1b[A', '\x1b[200~hello\x1b[201~', '\x1b[74;36;10;1;8;1_']) {
+      expect(isTerminalReportSequence(real)).toBe(false);
+    }
+  });
+
+  it('matches startup blocking dialogs through ConPTY ANSI cursor positioning', () => {
+    expect(STARTUP_BLOCK_RE.test(stripAnsiForMatch('\x1b[32mHooks\x1b[1Cneed\x1b[1Creview\x1b[39m'))).toBe(true);
+    expect(STARTUP_BLOCK_RE.test(stripAnsiForMatch('Do\x1b[1Cyou trust the files in this folder?'))).toBe(true);
+    expect(STARTUP_BLOCK_RE.test(stripAnsiForMatch('1. Yes, continue\r\n2. No, exit'))).toBe(true);
+    expect(STARTUP_BLOCK_RE.test(stripAnsiForMatch('FAKE AGENT 1234\n> '))).toBe(false);
+  });
+
+  it('prependEnvPath deduplicates case-variant Path keys on Windows', () => {
+    const env: Record<string, string> = { Path: 'C:\\Windows', PATH: 'C:\\Legacy' };
+    prependEnvPath(env, 'C:\\Shoal\\bin');
+    const pathKeys = Object.keys(env).filter(k => k.toLowerCase() === 'path');
+    expect(pathKeys).toHaveLength(1);
+    expect(env[pathKeys[0]]).toBe(`C:\\Shoal\\bin${path.delimiter}C:\\Windows`);
+    prependEnvPath(env, 'C:\\Shoal\\bin');
+    expect(env[pathKeys[0]]).toBe(`C:\\Shoal\\bin${path.delimiter}C:\\Windows`);
+  });
+
+  it('blocks queued delivery on Ctrl+C / startup prompt, cancels 300ms Enter on typing, and marks systemInjected', async () => {
+    vi.useFakeTimers();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sess-guard-'));
+    const writes: string[] = [];
+    let dataCb: (d: string) => void = () => {};
+    let exitCb: (e: { exitCode: number }) => void = () => {};
+    vi.spyOn(pty, 'spawn').mockImplementation((() => ({
+      pid: 9001, cols: 120, rows: 36, process: 'codex', handleFlowControl: false,
+      onData: (cb: (d: string) => void) => { dataCb = cb; return { dispose() {} }; },
+      onExit: (cb: (e: { exitCode: number }) => void) => { exitCb = cb; return { dispose() {} }; },
+      write: (d: string) => { writes.push(d); },
+      resize() {}, kill() { exitCb({ exitCode: 0 }); },
+      pause() {}, resume() {}, clear() {},
+    })) as typeof pty.spawn);
+
+    const mgr = new SessionManager({ port: 47899, token: 't', stateDir: tmp });
+    try {
+      const s = mgr.spawn({ taskId: 't1', projectId: 'p1', agent: 'fake', cwd: tmp, prompt: '' });
+      // Startup trust prompt blocks delivery until user confirms with Enter.
+      dataCb('Do you trust the files in this folder?\n1. Yes\n2. No, exit');
+      expect(mgr.enqueue(s.id, 'queued-msg', { system: true })).toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(writes).toEqual([]);
+
+      // User confirms trust prompt and waits past settle/typing windows -> delivery fires text, then user types in 300ms gap -> Enter cancelled!
+      mgr.input(s.id, '\r');
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'SessionStart', at: Date.now(), payload: { session_id: 'n1', source: 'startup' } });
+      await vi.advanceTimersByTimeAsync(5200);
+      expect(writes).toContain('queued-msg');
+      mgr.input(s.id, 'x'); // interrupts the 300ms Enter timer!
+      await vi.advanceTimersByTimeAsync(500);
+      expect(writes.filter(w => w === '\r')).toHaveLength(1); // only the user's earlier \r, NOT injected Enter!
+
+      // Ctrl+C while a message is queued freezes queue until explicit Enter or non-system enqueue.
+      expect(mgr.enqueue(s.id, 'after-ctrlc', { system: true })).toBe(true);
+      mgr.input(s.id, '\x03');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(writes).not.toContain('after-ctrlc');
+      // Pressing Enter unfreezes and drains the queued item after typing quiet.
+      mgr.input(s.id, '\r');
+      await vi.advanceTimersByTimeAsync(5600);
+      expect(writes).toContain('after-ctrlc');
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'n1', prompt: 'after-ctrlc' } });
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'Stop', at: Date.now(), payload: { session_id: 'n1' } });
+
+      // Focus/mouse reports must NOT disturb typing quiet or cancel Enter.
+      mgr.input(s.id, '\r');
+      let delivered = false;
+      expect(mgr.enqueue(s.id, 'clean-system', { system: true, onDelivered: () => { delivered = true; } })).toBe(true);
+      await vi.advanceTimersByTimeAsync(5260);
+      mgr.input(s.id, '\x1b[I\x1b[<0;1;1M'); // focus + mouse while waiting for 300ms Enter
+      await vi.advanceTimersByTimeAsync(400);
+      expect(writes).toContain('clean-system');
+      expect(delivered).toBe(true);
+      const hk = mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'n1', prompt: 'clean-system' } });
+      expect(hk).toEqual({ userTurn: false, systemInjected: true });
+    } finally {
+      await mgr.killAll();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
@@ -339,5 +446,114 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
   it('agyHookDisposition handles RateLimits and initial subagent guard', () => {
     expect(agyHookDisposition({ currentId: null, event: 'RateLimits', payload: {}, cwd: '/p', stateDir: '/s' })).toEqual({ kind: 'primary' });
     expect(agyHookDisposition({ currentId: null, event: 'SessionStart', payload: {}, cwd: '/p', stateDir: '/s' })).toEqual({ kind: 'ignore' });
+  });
+});
+
+describe('shutdown & Windows ConPTY process-tree cleanup', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('POST /api/shutdown returns 202 with server pid', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shutdown-'));
+    const net = await import('node:net');
+    const freePort = await new Promise<number>((resolve, reject) => {
+      const srv = net.createServer();
+      srv.listen(0, '127.0.0.1', () => {
+        const p = (srv.address() as AddressInfo).port;
+        srv.close(err => (err ? reject(err) : resolve(p)));
+      });
+    });
+    const store = createFileStore(path.join(tmp, 'state.json'));
+    const sessions = new SessionManager({ port: freePort, token: 't', stateDir: tmp });
+    const usage = createUsage({
+      stateDir: tmp,
+      source: { sessions: () => sessions.list(), tasks: () => store.tasks(), projects: () => store.projects() },
+    });
+    const onShutdown = vi.fn();
+    const app = createApp({ port: freePort, token: 't', store, sessions, stateDir: tmp, usage, onShutdown });
+    await new Promise<void>(resolve => app.server.listen(freePort, '127.0.0.1', resolve));
+    try {
+      const res = await fetch(`http://127.0.0.1:${freePort}/api/shutdown`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(res.status).toBe(202);
+      expect(await res.json()).toEqual({ pid: process.pid });
+      await new Promise(r => setImmediate(r));
+      expect(onShutdown).toHaveBeenCalledTimes(1);
+    } finally {
+      await sessions.killAll();
+      await new Promise<void>(resolve => app.server.close(() => resolve()));
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('killAll terminates real ConPTY tree and resolves promptly', async () => {
+    vi.restoreAllMocks();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-conpty-kill-'));
+    const binDir = path.join(tmp, 'bin');
+    const pidFile = path.join(tmp, 'grandchild.pid');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(binDir, 'shoal.cmd'),
+      `@echo off\r\n"%WORKBENCH_NODE%" -e "require('fs').writeFileSync(process.env.TEST_PID_FILE, String(process.pid)); setTimeout(() => {}, 30000);"\r\n`,
+    );
+
+    const prevPidFile = process.env.TEST_PID_FILE;
+    process.env.TEST_PID_FILE = pidFile;
+
+    const origSpawn = pty.spawn;
+    let realProc: pty.IPty | undefined;
+    vi.spyOn(pty, 'spawn').mockImplementation(((...args: Parameters<typeof pty.spawn>) => {
+      realProc = origSpawn(...args);
+      return realProc;
+    }) as typeof pty.spawn);
+
+    const mgr = new SessionManager({ port: 47898, token: 't', stateDir: tmp });
+    let buf = '';
+    const unsub = mgr.subscribe(m => {
+      if (m.t === 'out') buf += m.d;
+    });
+
+    const waitFor = async (pred: () => boolean, timeoutMs = 5000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!pred()) {
+        if (Date.now() > deadline) throw new Error('timed out waiting for ConPTY state');
+        await new Promise(r => setTimeout(r, 50));
+      }
+    };
+    const isAlive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      const info = mgr.spawn({ taskId: 't-conpty', projectId: 'p-conpty', agent: 'fake', cwd: os.tmpdir(), prompt: '' });
+      await waitFor(() => buf.includes('FAKE AGENT'));
+      mgr.input(info.id, 'shoal hold\r');
+      await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8').trim()) > 0);
+      const grandchildPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      expect(isAlive(realProc!.pid)).toBe(true);
+      expect(isAlive(grandchildPid)).toBe(true);
+
+      const started = Date.now();
+      await mgr.killAll();
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(info.exitCode).not.toBeNull();
+      await waitFor(() => !isAlive(realProc!.pid) && !isAlive(grandchildPid), 1500);
+      expect(isAlive(realProc!.pid)).toBe(false);
+      expect(isAlive(grandchildPid)).toBe(false);
+    } finally {
+      unsub();
+      await mgr.killAll();
+      if (prevPidFile === undefined) delete process.env.TEST_PID_FILE; else process.env.TEST_PID_FILE = prevPidFile;
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    }
   });
 });

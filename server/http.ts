@@ -7,20 +7,22 @@ import { pipeline } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, Project,
+  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerSendBody, Project,
   GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
 } from '../shared/protocol.ts';
-import { canResume, feedbackPrompt, forwardText } from '../shared/protocol.ts';
+import { canResume, feedbackPrompt, forwardText, isValidAgyModel } from '../shared/protocol.ts';
+import { createActivityTracker } from './activity.ts';
 import { clipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
 import { agyResumeId, agyTranscriptFile, availableAgents, claudeResumeId, ROOT } from './agents.ts';
+import { CollabError, createCollabManager } from './collab.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
 import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, readCodexQuota } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
 import { readTranscript } from './transcript.ts';
-import type { SessionManager } from './sessions.ts';
+import type { EnqueueOptions, SessionManager } from './sessions.ts';
 import { pickColor } from './store.ts';
 import type { Store } from './store.ts';
 import type { Usage } from './usage.ts';
@@ -161,7 +163,7 @@ export function createApp(cfg: AppConfig) {
     lastTelemetryJson = JSON.stringify(telemetry);
     return {
       projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
-      git: Object.fromEntries(gitMap), quota: quota.all(), telemetry,
+      git: Object.fromEntries(gitMap), quota: quota.all(), telemetry, activity: activity.all(),
     };
   };
 
@@ -183,14 +185,45 @@ export function createApp(cfg: AppConfig) {
     const raw = JSON.stringify(m);
     for (const c of clients) if (c.readyState === 1) c.send(raw);
   };
+  const activity = createActivityTracker({
+    sessions: () => sessions.list(),
+    onUpdate: (sessionId, act) => broadcast({ t: 'activity', sessionId, activity: act }),
+  });
+  for (const s of sessions.list()) if (s.status === 'working') activity.onSessionChange(s);
+
+  const collab = createCollabManager({
+    stateDir: cfg.stateDir,
+    store,
+    sessions,
+    availableAgents,
+    createPeerTask: ({ projectId, agent, title, prompt }) => createTask({ projectId, agent, title, prompt }),
+    deliverToTask: ({ targetTask, project, text, system, onDelivered, cardMeta }) => {
+      const prev = targetTask.sessionId ? sessions.list().find(s => s.id === targetTask.sessionId) : undefined;
+      const msg = '目标任务没有可续接的对话，无法投递协作消息';
+      const { task: next, session } = pasteIntoTask(
+        targetTask, project, prev, text, {},
+        { phase: 'active', phaseSince: Date.now() },
+        { noSession: msg, noConversation: msg },
+        { system, onDelivered },
+      );
+      const card = addCard(next, session.id, 'forward', text, cardMeta);
+      return { task: next, session, card };
+    },
+  });
+
   sessions.subscribe(m => {
     if (m.t === 'session') {
       // A terminal resize changes only cols/rows: not worth rewriting state.json for (the next real change saves them too).
-      if (!sizeOnly(store.getSession(m.session.id), m.session)) store.saveSession(m.session);
+      const saved = store.getSession(m.session.id);
+      if (!sizeOnly(saved, m.session)) store.saveSession(m.session);
+      activity.onSessionChange(m.session);
       broadcast(m);
       // Typing a follow-up in the terminal takes the task out of 待验收 / 已通过 / 已归档.
-      const task = m.session.status === 'working' ? store.getTask(m.session.taskId) : undefined;
-      if (task && task.sessionId === m.session.id && task.phase !== 'active') setPhase(task, 'active');
+      const task = store.getTask(m.session.taskId);
+      if (task && task.sessionId === m.session.id) {
+        if (m.session.status === 'working' && task.phase !== 'active') setPhase(task, 'active');
+        else if (saved?.status !== m.session.status) collab.syncProjectPeers(task.projectId);
+      }
       return;
     }
     broadcast(m);
@@ -212,6 +245,7 @@ export function createApp(cfg: AppConfig) {
     if (!ok) throw new HttpError(400, `路径不是已存在的目录：${abs}`);
     const project: Project = { id: crypto.randomUUID(), name, path: abs, createdAt: Date.now() };
     store.addProject(project);
+    collab.syncProjectPeers(project.id);
     broadcast({ t: 'project', project });
     void refreshGit(project.id);
     return project;
@@ -223,6 +257,11 @@ export function createApp(cfg: AppConfig) {
     if (!project) throw new HttpError(400, '项目不存在');
     const agent = body.agent as AgentKind;
     if (!availableAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
+    if (body.model !== undefined && (typeof body.model !== 'string' || !isValidAgyModel(body.model))) {
+      throw new HttpError(400, '模型档位无效');
+    }
+    const rawModel = body.model !== undefined ? body.model : store.settings().agyModel;
+    const model = agent === 'agy' && rawModel ? rawModel : undefined;
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     const lastPrompt = promptPreview(prompt);
     let title = typeof body.title === 'string' ? body.title.trim() : '';
@@ -239,13 +278,13 @@ export function createApp(cfg: AppConfig) {
     const now = Date.now();
     const task: Task = {
       id: crypto.randomUUID(), projectId: project.id, title, titleAuto, prompt, color: pickColor(store.tasks()),
-      agent, sessionId: null, createdAt: now,
+      agent, ...(model && { model }), sessionId: null, createdAt: now,
       phase: 'active', phaseSince: now, lastActiveAt: now, ...(lastPrompt && { lastPrompt }),
     };
     let session;
     try {
       session = sessions.spawn({
-        taskId: task.id, agent, cwd: project.path, prompt,
+        taskId: task.id, projectId: project.id, agent, cwd: project.path, prompt, model,
         cols: typeof body.cols === 'number' ? body.cols : undefined,
         rows: typeof body.rows === 'number' ? body.rows : undefined,
       });
@@ -255,6 +294,7 @@ export function createApp(cfg: AppConfig) {
     task.sessionId = session.id;
     store.addTask(task);
     store.saveSession(session);
+    collab.syncProjectPeers(project.id);
     broadcast({ t: 'task', task });
     broadcast({ t: 'session', session });
     if (fromPrompt) aiRetitle(task.id, title, prompt);
@@ -270,6 +310,7 @@ export function createApp(cfg: AppConfig) {
     if ([...title].length > 80) throw new HttpError(400, '任务标题太长');
     const task: Task = { ...old, title, titleAuto: false };
     store.updateTask(task);
+    collab.syncProjectPeers(task.projectId);
     broadcast({ t: 'task', task });
     return task;
   }
@@ -277,6 +318,7 @@ export function createApp(cfg: AppConfig) {
   function setPhase(task: Task, phase: TaskPhase): Task {
     const next: Task = { ...task, phase, phaseSince: Date.now() };
     store.updateTask(next);
+    collab.syncProjectPeers(next.projectId);
     broadcast({ t: 'task', task: next });
     return next;
   }
@@ -293,9 +335,11 @@ export function createApp(cfg: AppConfig) {
     if (!stale.length) return;
     const updated = stale.map(t => ({ ...t, phase: 'archived' as const, phaseSince: now }));
     store.updateTasks(updated);
+    for (const pid of new Set(updated.map(t => t.projectId))) collab.syncProjectPeers(pid);
     for (const task of updated) broadcast({ t: 'task', task });
   }
   autoArchive();
+  for (const p of store.projects()) collab.syncProjectPeers(p.id);
   const archiveTimer = setInterval(autoArchive, 3600_000);
   archiveTimer.unref();
 
@@ -309,6 +353,7 @@ export function createApp(cfg: AppConfig) {
     );
     const updated = targets.map(t => ({ ...t, phase: 'archived' as const, phaseSince: now }));
     store.updateTasks(updated);
+    collab.syncProjectPeers(project.id);
     for (const task of updated) broadcast({ t: 'task', task });
     return { tasks: updated };
   }
@@ -318,19 +363,27 @@ export function createApp(cfg: AppConfig) {
     task: Task, project: Project, prev: SessionInfo | undefined,
     o: { prompt: string; resume?: string; cols?: number; rows?: number }, patch: Partial<Task> = {},
   ): { task: Task; session: SessionInfo } {
+    const merged = { ...task, ...patch };
+    const model = merged.agent === 'agy'
+      ? (patch.agent && patch.agent !== task.agent ? store.settings().agyModel : merged.model) || undefined
+      : undefined;
     let session;
     try {
-      session = sessions.spawn({ taskId: task.id, agent: { ...task, ...patch }.agent, cwd: project.path, ...o });
+      session = sessions.spawn({ taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model, ...o });
     } catch (e) {
       throw new HttpError(500, `启动失败：${(e as Error).message}`);
     }
     if (prev) {
+      collab.clearSessionState(prev.id);
+      activity.onRemove(prev.id);
       sessions.remove(prev.id);
       store.removeSession(prev.id);
     }
-    const next: Task = { ...task, ...patch, sessionId: session.id, lastActiveAt: session.startedAt };
+    const next: Task = { ...merged, ...(model ? { model } : {}), sessionId: session.id, lastActiveAt: session.startedAt };
+    if (merged.agent !== 'agy') delete next.model;
     store.updateTask(next);
     store.saveSession(session);
+    collab.syncProjectPeers(project.id);
     broadcast({ t: 'task', task: next });
     broadcast({ t: 'session', session });
     return { task: next, session };
@@ -419,19 +472,21 @@ export function createApp(cfg: AppConfig) {
   function pasteIntoTask(
     task: Task, project: Project, prev: SessionInfo | undefined, text: string, size: { cols?: number; rows?: number }, patch: Partial<Task>,
     errors: { noSession: string; noConversation: string },
+    enqueueOpts?: EnqueueOptions,
   ): { task: Task; session: SessionInfo } {
     if (!prev) throw new HttpError(400, errors.noSession);
+    const system = enqueueOpts?.system === true;
     if (prev.status !== 'exited') {
-      const next: Task = { ...task, ...patch, lastActiveAt: Date.now() };
+      const next: Task = system ? { ...task, ...patch } : { ...task, ...patch, lastActiveAt: Date.now() };
       store.updateTask(next);
       broadcast({ t: 'task', task: next });
-      sessions.enqueue(prev.id, text);
+      sessions.enqueue(prev.id, text, enqueueOpts);
       return { task: next, session: prev };
     }
     const native = resumableNative(prev);
     if (!native) throw new HttpError(400, errors.noConversation);
     const r = replaceSession(task, project, prev, { prompt: '', resume: native, ...size }, patch);
-    sessions.enqueue(r.session.id, text);
+    sessions.enqueue(r.session.id, text, enqueueOpts);
     return r;
   }
 
@@ -512,8 +567,14 @@ export function createApp(cfg: AppConfig) {
     if (!card.body.trim()) throw new HttpError(400, '卡片内容为空');
     const source = store.getTask(card.taskId);
     if (!source) throw new HttpError(404, '任务不存在');
+    const replyBack = body.replyBack === true;
     const sourceAgent = sessions.list().find(s => s.id === card.sessionId)?.agent ?? source.agent;
-    const text = forwardText({ title: source.title, agent: sourceAgent }, card.body, typeof body.note === 'string' ? body.note : undefined);
+    const text = forwardText(
+      { title: source.title, agent: sourceAgent },
+      card.body,
+      typeof body.note === 'string' ? body.note : undefined,
+      { replyBack },
+    );
     const to = body.to as Partial<{ taskId: string; projectId: string; agent: AgentKind }> | undefined;
     const size = { cols: typeof body.cols === 'number' ? body.cols : undefined, rows: typeof body.rows === 'number' ? body.rows : undefined };
     let task: Task;
@@ -527,14 +588,53 @@ export function createApp(cfg: AppConfig) {
       if (!availableAgents().includes(target.agent)) throw new HttpError(400, `智能体不可用：${target.agent}`);
       const prev = target.sessionId ? sessions.list().find(s => s.id === target.sessionId) : undefined;
       const msg = '目标任务没有可续接的对话，请转发到新任务';
-      ({ task, session } = pasteIntoTask(target, project, prev, text, size, { phase: 'active', phaseSince: Date.now() }, { noSession: msg, noConversation: msg }));
+      let obligationId: string | undefined;
+      let boundSessionId = prev?.id ?? '';
+      ({ task, session } = pasteIntoTask(
+        target, project, prev, text, size,
+        { phase: 'active', phaseSince: Date.now() },
+        { noSession: msg, noConversation: msg },
+        replyBack
+          ? {
+              system: true,
+              onDelivered: () => {
+                const sid = store.getTask(target.id)?.sessionId ?? boundSessionId;
+                if (sid) collab.onSystemDelivered(sid, 1, obligationId);
+              },
+            }
+          : undefined,
+      ));
+      boundSessionId = session.id;
+      if (replyBack) {
+        obligationId = collab.registerReplyBack({
+          targetTaskId: task.id,
+          targetSessionId: session.id,
+          sourceTaskId: source.id,
+          hop: 1,
+          immediateArm: false,
+        });
+      }
     } else if (to && typeof to.projectId === 'string') {
       ({ task, session } = createTask({ projectId: to.projectId, agent: to.agent, prompt: text, title: [...`转发：${source.title}`].slice(0, 80).join(''), ...size }));
+      if (replyBack) {
+        collab.seedSessionHop(session.id, 1);
+        collab.registerReplyBack({
+          targetTaskId: task.id,
+          targetSessionId: session.id,
+          sourceTaskId: source.id,
+          hop: 1,
+          immediateArm: true,
+        });
+      }
     } else {
       throw new HttpError(400, '没有指定转发目标');
     }
-    const saved = addCard(task, session.id, 'forward', text, { sourceTaskId: source.id, sourceCardId: card.id });
-    return { task, session, card: saved };
+    const saved = addCard(task, session.id, 'forward', text, {
+      sourceTaskId: source.id,
+      sourceCardId: card.id,
+      ...(replyBack && { replyBack: true }),
+    });
+    return { task, session, card: saved, ...(replyBack && { replyBack: true }) };
   }
 
   // A finished turn becomes a result card and moves the task to 待验收.
@@ -542,9 +642,22 @@ export function createApp(cfg: AppConfig) {
     const session = sessions.list().find(s => s.id === body.sessionId);
     const task = session ? store.getTask(session.taskId) : undefined;
     if (!session || !task || task.sessionId !== session.id) return;
-    if (detectLimit(session.agent, 'Stop', (body.payload ?? {}) as Record<string, unknown>)) return; // out of quota, not a result
-    addCard(task, session.id, 'result', lastReply(session.agent, body.payload) ?? '（没有拿到这一轮的最后回复，请看终端）');
+    const p = (body.payload ?? {}) as Record<string, unknown>;
+    if (detectLimit(session.agent, 'Stop', p)) {
+      collab.onPrimaryStop({ task, session, replyText: '', canceledOrLimit: true });
+      return; // out of quota, not a result
+    }
+    const replyText = lastReply(session.agent, body.payload);
+    const card = addCard(task, session.id, 'result', replyText ?? '（没有拿到这一轮的最后回复，请看终端）');
     setPhase(task, 'review');
+    const canceled = typeof p.error === 'string' && p.error.trim() !== '';
+    collab.onPrimaryStop({
+      task,
+      session,
+      replyText: replyText ?? card.body,
+      resultCardId: card.id,
+      canceledOrLimit: canceled,
+    });
     void refreshGit(task.projectId); // the turn probably changed files
   }
 
@@ -682,7 +795,7 @@ export function createApp(cfg: AppConfig) {
     }
     if (method === 'GET' && pathname === '/api/state') return send(res, 200, snapshot());
     if (method === 'POST' && pathname === '/api/shutdown' && cfg.onShutdown) {
-      send(res, 202);
+      send(res, 202, { pid: process.pid });
       return void setImmediate(cfg.onShutdown);
     }
     if (method === 'GET' && pathname === '/api/clipboard/files') {
@@ -706,7 +819,17 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
     if (method === 'POST' && pathname === '/api/settings') {
       if (body.aiTitles !== undefined && typeof body.aiTitles !== 'boolean') throw new HttpError(400, '设置值无效');
-      const settings: Settings = { ...store.settings(), ...(typeof body.aiTitles === 'boolean' ? { aiTitles: body.aiTitles } : {}) };
+      if (body.agyModel !== undefined && (typeof body.agyModel !== 'string' || !isValidAgyModel(body.agyModel))) {
+        throw new HttpError(400, '设置值无效');
+      }
+      const settings: Settings = {
+        ...store.settings(),
+        ...(typeof body.aiTitles === 'boolean' ? { aiTitles: body.aiTitles } : {}),
+      };
+      if (typeof body.agyModel === 'string') {
+        if (body.agyModel) settings.agyModel = body.agyModel;
+        else delete settings.agyModel;
+      }
       store.setSettings(settings);
       broadcast({ t: 'settings', settings });
       return send(res, 200, settings);
@@ -737,8 +860,13 @@ export function createApp(cfg: AppConfig) {
       const task = store.getTask(m[1]);
       if (!task) throw new HttpError(404, '任务不存在');
       cfg.usage.scan(); // records which task its sessions belonged to before they are dropped
-      if (task.sessionId) sessions.remove(task.sessionId);
+      if (task.sessionId) {
+        collab.clearSessionState(task.sessionId);
+        activity.onRemove(task.sessionId);
+        sessions.remove(task.sessionId);
+      }
       store.removeTask(task.id);
+      collab.removeTaskSnapshot(task.projectId, task.id);
       broadcast({ t: 'task-removed', id: task.id });
       return send(res, 200, { ok: true });
     }
@@ -750,7 +878,7 @@ export function createApp(cfg: AppConfig) {
       const q = new URL(req.url ?? '/', 'http://x').searchParams;
       if (method === 'GET' && sub === 'changes') {
         const changes = await listChanges(project.path);
-        if (!sameGit(gitMap.get(project.id), changes.git)) {
+        if ((changes.git !== null || !gitMap.has(project.id)) && !sameGit(gitMap.get(project.id), changes.git)) {
           gitMap.set(project.id, changes.git);
           broadcast({ t: 'git', projectId: project.id, git: changes.git });
         }
@@ -792,8 +920,15 @@ export function createApp(cfg: AppConfig) {
       if (!project) throw new HttpError(404, '项目不存在');
       cfg.usage.scan(); // records which project / task its sessions belonged to before they are dropped
       const mine = store.tasks().filter(t => t.projectId === project.id);
-      for (const t of mine) if (t.sessionId) sessions.remove(t.sessionId);
+      for (const t of mine) {
+        if (t.sessionId) {
+          collab.clearSessionState(t.sessionId);
+          activity.onRemove(t.sessionId);
+          sessions.remove(t.sessionId);
+        }
+      }
       store.removeProject(project.id);
+      collab.removeProjectCollab(project.id);
       gitMap.delete(project.id);
       for (const t of mine) broadcast({ t: 'task-removed', id: t.id });
       broadcast({ t: 'project-removed', id: project.id });
@@ -803,6 +938,26 @@ export function createApp(cfg: AppConfig) {
     throw new HttpError(404, '未找到接口');
   }
 
+  async function handlePeer(req: http.IncomingMessage, res: http.ServerResponse, pathname: string) {
+    if (req.headers.origin !== undefined) throw new HttpError(403, 'CLI 内部协作接口禁止跨源浏览器访问');
+    const rawAuth = req.headers.authorization ?? '';
+    const bearer = rawAuth.startsWith('Bearer ') ? rawAuth.slice(7).trim() : '';
+    const caller = sessions.resolvePeerToken(bearer);
+    if (!caller) throw new HttpError(401, '无效或已过期的协作会话令牌');
+    if (caller.subagentWait) throw new HttpError(403, 'Antigravity 子代理等待期间禁止发起对外协作请求');
+
+    const method = req.method ?? 'GET';
+    if (method === 'GET' && pathname === '/api/peer/peers') {
+      return send(res, 200, collab.listPeers(caller.session.id));
+    }
+    if (method === 'POST' && pathname === '/api/peer/send') {
+      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) throw new HttpError(415, '需要 application/json');
+      const body = parseJson(await readBody(req)) as unknown as PeerSendBody;
+      return send(res, 200, collab.sendPeer(caller.session.id, body));
+    }
+    throw new HttpError(404, '未找到协作接口');
+  }
+
   async function handleHook(req: http.IncomingMessage, res: http.ServerResponse) {
     if (req.method !== 'POST') throw new HttpError(405, 'method not allowed');
     const got = Buffer.from(req.headers.authorization ?? '');
@@ -810,15 +965,37 @@ export function createApp(cfg: AppConfig) {
     if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) throw new HttpError(401, 'unauthorized');
     const b = parseJson(await readBody(req)) as Partial<HookBody>;
     if (typeof b.sessionId !== 'string' || typeof b.event !== 'string') throw new HttpError(400, 'bad hook body');
-    const hookRes = sessions.hook(b as HookBody);
+    const hookBody = b as HookBody;
+    const hookRes = sessions.hook(hookBody);
+    let needTelemetry = false;
     if (hookRes) { // unknown sessions are logged and ignored
-      observeQuota(b as HookBody);
-      autoRename(b as HookBody);
-      updateLastPrompt(b as HookBody, hookRes.userTurn);
-      if (b.event === 'Stop') onStop(b as HookBody);
-      if (b.event === 'Stop' || b.event === 'PostInvocation') refreshTelemetry(true);
+      const latest = sessions.list().find(s => s.id === hookBody.sessionId);
+      if (latest) {
+        activity.onHook(latest, hookBody.event, (hookBody.payload ?? {}) as Record<string, unknown>, {
+          intermediateStop: hookRes.intermediateStop,
+        });
+      }
+      if (!hookRes.intermediateStop) {
+        observeQuota(hookBody);
+        if (!hookRes.systemInjected) {
+          autoRename(hookBody);
+          updateLastPrompt(hookBody, hookRes.userTurn);
+        }
+        if (hookBody.event === 'UserPromptSubmit' || hookBody.event === 'PreInvocation') {
+          collab.onPromptStart(hookBody.sessionId, hookRes.systemInjected === true);
+        }
+        if (hookBody.event === 'Stop') onStop(hookBody);
+        else if (hookBody.event === 'StopFailure') {
+          const task = latest ? store.getTask(latest.taskId) : undefined;
+          if (latest && task && task.sessionId === latest.id) {
+            collab.onPrimaryStop({ task, session: latest, replyText: '', canceledOrLimit: true });
+          }
+        }
+        if (hookBody.event === 'Stop' || hookBody.event === 'PostInvocation') needTelemetry = true;
+      }
     }
     send(res, 204);
+    if (needTelemetry) setImmediate(() => refreshTelemetry(true));
   }
 
   function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string) {
@@ -843,14 +1020,16 @@ export function createApp(cfg: AppConfig) {
     const run = async () => {
       if (!hosts.has(req.headers.host ?? '')) throw new HttpError(403, 'Host 不被允许');
       if (pathname === '/hook') return handleHook(req, res);
+      if (pathname.startsWith('/api/peer/')) return handlePeer(req, res, pathname);
       if (pathname.startsWith('/api/')) return handleApi(req, res, pathname);
       if (req.method === 'GET' || req.method === 'HEAD') return serveStatic(req, res, pathname);
       throw new HttpError(404, 'not found');
     };
     run().catch(e => {
       if (res.headersSent) return;
-      if (e instanceof HttpError || e instanceof WorkspaceError) {
-        send(res, e.status, { error: e.message, ...(e.code && { code: e.code }), ...e.extra });
+      if (e instanceof HttpError || e instanceof WorkspaceError || e instanceof CollabError) {
+        const extra = e instanceof HttpError ? { ...(e.code && { code: e.code }), ...e.extra } : {};
+        send(res, e.status, { error: e.message, ...extra });
       } else {
         console.error('[http]', e);
         send(res, 500, { error: '服务器内部错误' });
@@ -860,14 +1039,23 @@ export function createApp(cfg: AppConfig) {
   server.keepAliveTimeout = 60_000;
   server.headersTimeout = 65_000;
 
-  // Poll git and live usage only while somebody is looking; unref so timers never keep the process alive.
+  // Poll git, live usage, and transcript activity only while somebody is looking; unref so timers never keep the process alive.
   const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);
   gitTimer.unref();
   const usageTimer = setInterval(() => {
     if (clients.size && sessions.list().some(s => s.status === 'working')) refreshTelemetry();
   }, 4_000);
   usageTimer.unref();
-  server.on('close', () => { clearInterval(archiveTimer); clearInterval(gitTimer); clearInterval(usageTimer); });
+  const activityTimer = setInterval(() => {
+    if (clients.size && activity.hasActive()) activity.tick();
+  }, 750);
+  activityTimer.unref();
+  server.on('close', () => {
+    clearInterval(archiveTimer);
+    clearInterval(gitTimer);
+    clearInterval(usageTimer);
+    clearInterval(activityTimer);
+  });
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url ?? '/', 'http://x').pathname;
@@ -882,6 +1070,7 @@ export function createApp(cfg: AppConfig) {
 
   wss.on('connection', ws => {
     clients.add(ws);
+    if (activity.hasActive()) activity.tick();
     void refreshAllGit(); // fill in (or freshen) git state for a client that just opened
     ws.on('close', () => clients.delete(ws));
     ws.on('error', () => clients.delete(ws));

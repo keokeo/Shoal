@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import type { Card, Project, SessionInfo, Settings, Task } from '../shared/protocol.ts';
-import { CARDS_PER_TASK, DEFAULT_SETTINGS, TASK_COLORS } from '../shared/protocol.ts';
+import { CARDS_PER_TASK, DEFAULT_SETTINGS, isValidAgyModel, TASK_COLORS } from '../shared/protocol.ts';
 import { cleanTitle } from './titles.ts';
 
 // Pre-muted palette; tasks stored with these are migrated to the TASK_COLORS entry at the same index.
@@ -47,6 +47,7 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
   const cards = new Map<string, Card>((init?.cards ?? []).map(c => [c.id, c]));
   let settings: Settings = { ...DEFAULT_SETTINGS };
   if (typeof init?.settings?.aiTitles === 'boolean') settings.aiTitles = init.settings.aiTitles;
+  if (isValidAgyModel(init?.settings?.agyModel) && init.settings.agyModel) settings.agyModel = init.settings.agyModel;
   const store: Store = {
     settings: () => ({ ...settings }),
     setSettings: s => { settings = { ...s }; onChange(store); },

@@ -51,6 +51,7 @@ const shutdown = () => {
   if (stopping) process.exit(0);
   stopping = true;
   server.close();
+  setTimeout(() => process.exit(0), 12_000).unref();
   void sessions.killAll().then(() => process.exit(0));
 };
 process.on('SIGINT', shutdown);

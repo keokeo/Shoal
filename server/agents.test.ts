@@ -366,3 +366,29 @@ describe('claude status line', () => {
     }
   });
 });
+
+describe('shoal collab hooks and agy collabDir', () => {
+  it('writeHookFiles writes shoal-cli.mjs, shoal.cmd, LF-only shoal, collab/, and syncs agy skill', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shoal-'));
+    const dir = path.join(root, 'state');
+    writeHookFiles(dir);
+    expect(fs.existsSync(path.join(dir, 'bin', 'shoal-cli.mjs'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'bin', 'shoal.cmd'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'collab'))).toBe(true);
+    const shoalSh = fs.readFileSync(path.join(dir, 'bin', 'shoal'), 'utf8');
+    expect(shoalSh).not.toContain('\r\n');
+    expect(shoalSh).toContain('shoal-cli.mjs');
+    const syncedSkill = path.join(dir, 'agy-hooks', '.agents', 'skills', 'shoal-collab', 'SKILL.md');
+    expect(fs.existsSync(syncedSkill)).toBe(true);
+    expect(fs.readFileSync(syncedSkill, 'utf8')).toContain('WORKBENCH_PEERS_FILE');
+  });
+
+  it('buildLaunch passes raw --add-dir <collabDir> for agy even when path contains spaces', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-agy-collab-'));
+    const dir = path.join(root, 'state');
+    const collabDir = path.join(root, 'collab dir with spaces');
+    const launch = buildLaunch({ agent: 'agy', sessionId: 'sid-collab', prompt: 'hi', stateDir: dir, collabDir });
+    const addDirs = launch.args.flatMap((v, i) => (v === '--add-dir' ? [launch.args[i + 1]] : []));
+    expect(addDirs).toContain(collabDir);
+  });
+});

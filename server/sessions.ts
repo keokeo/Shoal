@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -17,24 +18,84 @@ const DELIVERY_GAP_MS = 2000; // between two deliveries to the same session
 // Margin after the Stop hook: it fires as the turn ends, while the TUI may still be redrawing its prompt.
 const SETTLE_MS = 1500;
 const ENTER_DELAY_MS = 300; // pasted text first, Enter separately
+const DELIVERY_INFLIGHT_MS = 8000; // lock queue until UserPromptSubmit/PreInvocation arrives (or lock expires)
+const SYSTEM_INJECT_TTL_MS = 15_000;
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
 // Claude Code notes its PID when a fullscreen launch starts and clears it 10 s after the first frame. A process killed
 // before that counts as a crash, and two of them turn fullscreen (and with it mouse clicks on its menus) off for that version.
 const CLAUDE_HEALTHY_MS = 11_000;
 export const ENV_STRIP = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_AGENT|CODEX_SANDBOX|CODEX_THREAD|AGY_SESSION)/;
+export const STARTUP_BLOCK_RE = /Hooks need review|Do you trust the files in this folder|trust this folder|No,\s*exit/i;
+
+const TERM_REPORT_RE = /^(?:\x1b\[(?:[IO]|<\d+(?:;\d+)*[Mm]|\d+(?:;\d+)*R|[?>=]?[\d;]*c|\?[\d;]+\$y)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+$/;
+
+// Auto-generated terminal reports (focus events, SGR mouse, CPR, DA, OSC replies) are NOT user typing.
+export function isTerminalReportSequence(d: string): boolean {
+  return d === '' || TERM_REPORT_RE.test(d);
+}
+
+// Removes ANSI control sequences (expanding CSI cursor-forward into spaces) so TUI trust prompts remain matchable.
+export function stripAnsiForMatch(text: string): string {
+  return text
+    .replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(Math.max(1, Number(n) || 1)))
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '');
+}
+
+// Prepends `dir` to Path/PATH while deduplicating case-variant keys (`Path` vs `PATH` on Windows).
+export function prependEnvPath(env: Record<string, string>, dir: string): void {
+  if (!dir) return;
+  let existing = '';
+  for (const k of Object.keys(env)) {
+    if (k.toLowerCase() === 'path') {
+      if (!existing && env[k]) existing = env[k];
+      delete env[k];
+    }
+  }
+  const first = existing.split(path.delimiter)[0];
+  const alreadyFirst = first && (process.platform === 'win32' ? first.toLowerCase() === dir.toLowerCase() : first === dir);
+  const key = process.platform === 'win32' ? 'Path' : 'PATH';
+  env[key] = alreadyFirst ? existing : existing ? `${dir}${path.delimiter}${existing}` : dir;
+}
+
+export interface EnqueueOptions {
+  system?: boolean;
+  onDelivered?: () => void;
+}
+
+interface QueuedMessage {
+  text: string;
+  system: boolean;
+  onDelivered?: () => void;
+}
 
 interface Live {
   info: SessionInfo;
   cwd: string;
+  peerToken: string;
   proc: pty.IPty;
   buf: string;
   quiet: NodeJS.Timeout | null;
   removed: boolean;
-  queue: string[]; // texts waiting to be pasted (FIFO)
+  exitWaiters: (() => void)[];
+  queue: QueuedMessage[]; // messages waiting to be pasted (FIFO)
   permBlocked: boolean; // a permission prompt is open, so typed text would answer it
-  lastInputAt: number; // last keystroke from the user (injected writes do not count)
+  startupBlocked: boolean; // a trust / hooks-review startup prompt was detected before first turn
+  firstTurnSeen: boolean;
+  startupTail: string;
+  hasDraft: boolean; // user typed/pasted uncommitted characters at the prompt
+  interruptedByUser: boolean; // user pressed Ctrl+C while messages were queued
+  lastInputAt: number; // last keystroke from the user (injected writes & terminal reports do not count)
   lastDeliveryAt: number;
+  deliveringUntil: number;
+  inputSeq: number;
+  enterTimer: NodeJS.Timeout | null;
+  enterWasSystem: boolean;
+  systemInjectedPending: number;
+  systemInjectedUntil: number;
+  subagentWait: boolean; // true while agy main conversation waits for async subagents (intermediate-stop)
   modes: Map<number, boolean>; // last state of each REPLAY_MODES mode the CLI set
   tail: string; // end of the previous PTY chunk, so a mode switch split across chunks is still seen
   trimmed: boolean; // buf has lost its start
@@ -64,9 +125,11 @@ export interface SessionManagerConfig {
 
 export interface SpawnOptions {
   taskId: string;
+  projectId?: string;
   agent: AgentKind;
   cwd: string;
   prompt: string;
+  model?: string; // optional CLI model slug (for agy)
   cols?: number;
   rows?: number;
   resume?: string; // native session id to reopen
@@ -172,12 +235,25 @@ export interface DeliveryState {
   permBlocked: boolean;
   lastInputAt: number;
   lastDeliveryAt: number;
+  initialPromptPending?: boolean;
+  startupBlocked?: boolean;
+  deliveringUntil?: number;
+  hasDraft?: boolean;
+  interruptedByUser?: boolean;
 }
 
 // Whether the head of a session's queue may be pasted now.
 export function deliverable(s: DeliveryState, now: number): boolean {
-  return (s.status === 'needs_you' || s.status === 'idle') && now - s.statusSince >= SETTLE_MS && !s.permBlocked
-    && now - s.lastInputAt >= TYPING_QUIET_MS && now - s.lastDeliveryAt >= DELIVERY_GAP_MS;
+  return (s.status === 'needs_you' || s.status === 'idle')
+    && now - s.statusSince >= SETTLE_MS
+    && !s.permBlocked
+    && !s.initialPromptPending
+    && !s.startupBlocked
+    && !s.hasDraft
+    && !s.interruptedByUser
+    && now >= (s.deliveringUntil ?? 0)
+    && now - s.lastInputAt >= TYPING_QUIET_MS
+    && now - s.lastDeliveryAt >= DELIVERY_GAP_MS;
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n)));
@@ -185,6 +261,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, M
 export class SessionManager {
   private live = new Map<string, Live>();
   private dead = new Map<string, SessionInfo>(); // restored from disk, no process
+  private peerTokens = new Map<string, string>(); // peerToken -> sessionId
   private listeners = new Set<(m: ServerMsg) => void>();
   private cfg: SessionManagerConfig;
   private queueTimer: NodeJS.Timeout | null = null;
@@ -236,10 +313,30 @@ export class SessionManager {
     }
   }
 
+  resolvePeerToken(token: string): { session: SessionInfo; subagentWait: boolean } | undefined {
+    if (!token) return undefined;
+    const got = Buffer.from(token);
+    for (const [candidate, sid] of this.peerTokens) {
+      const want = Buffer.from(candidate);
+      if (got.length === want.length && crypto.timingSafeEqual(got, want)) {
+        const s = this.live.get(sid);
+        if (!s || s.removed || s.info.status === 'exited') return undefined;
+        return { session: s.info, subagentWait: s.subagentWait };
+      }
+    }
+    return undefined;
+  }
+
   spawn(o: SpawnOptions): SessionInfo {
     const id = crypto.randomUUID();
-    const launch = buildLaunch({ agent: o.agent, sessionId: id, prompt: o.prompt, stateDir: this.cfg.stateDir, resume: o.resume });
+    const peerToken = crypto.randomBytes(32).toString('hex');
+    const collabDir = o.projectId ? path.join(this.cfg.stateDir, 'collab', o.projectId) : undefined;
+    const launch = buildLaunch({
+      agent: o.agent, sessionId: id, prompt: o.prompt, stateDir: this.cfg.stateDir,
+      resume: o.resume, model: o.model, collabDir,
+    });
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k))) as Record<string, string>;
+    prependEnvPath(env, path.join(this.cfg.stateDir, 'bin'));
     Object.assign(env, {
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',
@@ -249,6 +346,9 @@ export class SessionManager {
       WORKBENCH_SESSION_ID: id,
       WORKBENCH_PORT: String(this.cfg.port),
       WORKBENCH_HOOK_TOKEN: this.cfg.token,
+      WORKBENCH_PEER_TOKEN: peerToken,
+      WORKBENCH_NODE: process.execPath,
+      ...(collabDir ? { WORKBENCH_COLLAB_DIR: collabDir, WORKBENCH_PEERS_FILE: path.join(collabDir, 'PEERS.md') } : {}),
     });
     // Our status line (for the rate limits) replaces the user's own; the relay script runs theirs.
     const userSl = o.agent === 'claude' ? userStatusLine(o.cwd) : o.agent === 'agy' ? agyUserStatusLine().command : undefined;
@@ -262,16 +362,24 @@ export class SessionManager {
         id, taskId: o.taskId, agent: o.agent, nativeSessionId: launch.nativeSessionId, resumable: Boolean(o.resume || o.prompt),
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
-      cwd: o.cwd, proc, buf: '', quiet: null, removed: false,
-      queue: [], permBlocked: false, lastInputAt: 0, lastDeliveryAt: 0, modes: new Map(), tail: '', trimmed: false, firstOutAt: 0,
+      cwd: o.cwd, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
+      queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '',
+      hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
+      inputSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
+      modes: new Map(), tail: '', trimmed: false, firstOutAt: 0,
       initialPromptPending: Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
+    this.peerTokens.set(peerToken, id);
     this.armQuiet(s);
     proc.onData(d => {
       if (!s.firstOutAt) s.firstOutAt = Date.now();
       trackModes(s.modes, s.tail + d);
       s.tail = (s.tail + d).slice(-MODE_TAIL);
+      if (!s.firstTurnSeen) {
+        s.startupTail = (s.startupTail + d).slice(-1024);
+        if (STARTUP_BLOCK_RE.test(stripAnsiForMatch(s.startupTail))) s.startupBlocked = true;
+      }
       s.buf += d;
       if (s.buf.length > BUF_MAX) {
         let tail = s.buf.slice(-BUF_KEEP);
@@ -284,11 +392,19 @@ export class SessionManager {
       if (!s.removed) this.emit({ t: 'out', id, d });
     });
     proc.onExit(e => {
+      this.peerTokens.delete(s.peerToken);
       if (s.quiet) clearTimeout(s.quiet);
+      if (s.enterTimer) {
+        clearTimeout(s.enterTimer);
+        s.enterTimer = null;
+      }
+      s.deliveringUntil = 0;
       s.info.exitCode = e.exitCode;
       this.log({ kind: 'exit', sessionId: id, agent: o.agent, exitCode: e.exitCode, at: Date.now() });
       this.dropQueue(s);
       this.apply(s, { type: 'exit' });
+      const waiters = s.exitWaiters.splice(0);
+      for (const w of waiters) w();
     });
     return s.info;
   }
@@ -296,7 +412,11 @@ export class SessionManager {
   // (Re)starts the "no output while still starting" timer.
   private armQuiet(s: Live) {
     if (s.quiet) clearTimeout(s.quiet);
-    s.quiet = setTimeout(() => this.apply(s, { type: 'quiet' }), QUIET_MS);
+    s.quiet = setTimeout(() => {
+      // Fallback for CLIs that start quietly without emitting UserPromptSubmit: never leave initialPromptPending wedged.
+      if (s.info.status === 'starting') s.initialPromptPending = false;
+      this.apply(s, { type: 'quiet' });
+    }, QUIET_MS);
   }
 
   private apply(s: Live, ev: StatusEvent) {
@@ -314,7 +434,7 @@ export class SessionManager {
     this.emit({ t: 'session', session: s.info });
   }
 
-  hook(body: HookBody): false | { userTurn: boolean } {
+  hook(body: HookBody): false | { userTurn: boolean; intermediateStop?: boolean; systemInjected?: boolean } {
     this.log({ kind: 'hook', ...body });
     const s = this.live.get(body.sessionId);
     if (!s) {
@@ -345,11 +465,13 @@ export class SessionManager {
         changed = true;
       }
       if (act.kind === 'intermediate-stop') {
+        s.subagentWait = true;
         const prevStatus = s.info.status;
         this.apply(s, { type: 'hook', event: 'PreInvocation' });
         if (changed && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
-        return false;
+        return { userTurn: false, intermediateStop: true };
       }
+      if (body.event !== 'RateLimits') s.subagentWait = false;
     } else {
       const nativeUpdate = nativeIdUpdate(s.info.nativeSessionId, body.event, p.session_id, p.source);
       if (nativeUpdate) {
@@ -368,14 +490,32 @@ export class SessionManager {
       changed = true;
     }
     let userTurn = false;
+    let systemInjected = false;
     if (PROMPT_EVENTS.has(body.event)) {
+      s.firstTurnSeen = true;
+      s.startupBlocked = false;
+      s.deliveringUntil = 0;
+      s.hasDraft = false;
+      s.interruptedByUser = false;
+      const now = Date.now();
+      if (s.systemInjectedPending > 0 && now <= s.systemInjectedUntil) {
+        s.systemInjectedPending--;
+        systemInjected = true;
+      } else if (s.systemInjectedPending > 0) {
+        s.systemInjectedPending = 0;
+      }
       if (s.initialPromptPending) {
         s.initialPromptPending = false;
-      } else if (body.event === 'UserPromptSubmit' || beforeStatus !== 'working' || s.info.nativeSessionId !== beforeNative) {
+      } else if (!systemInjected && (body.event === 'UserPromptSubmit' || beforeStatus !== 'working' || s.info.nativeSessionId !== beforeNative)) {
         userTurn = true;
       }
     } else if (body.event === 'SessionStart' && beforeNative !== null && s.info.nativeSessionId !== beforeNative) {
       userTurn = true;
+    } else if (body.event === 'Stop' || body.event === 'StopFailure') {
+      s.firstTurnSeen = true;
+      s.startupBlocked = false;
+      s.deliveringUntil = 0;
+      s.initialPromptPending = false;
     }
     const lim = detectLimit(s.info.agent, body.event, p);
     if (lim) {
@@ -391,23 +531,59 @@ export class SessionManager {
     const before = s.info.status;
     this.apply(s, { type: 'hook', event: body.event });
     if (changed && s.info.status === before) this.emit({ t: 'session', session: s.info });
-    return { userTurn };
+    return { userTurn, ...(systemInjected && { systemInjected: true }) };
   }
 
   input(id: string, d: string) {
     const s = this.live.get(id);
     if (!s || s.info.status === 'exited') return;
+    if (isTerminalReportSequence(d)) {
+      s.proc.write(d);
+      return;
+    }
+    const wasPermBlocked = s.permBlocked;
     s.lastInputAt = Date.now();
+    s.inputSeq++;
     s.permBlocked = false;
+    if (s.enterTimer) {
+      clearTimeout(s.enterTimer);
+      s.enterTimer = null;
+      s.deliveringUntil = 0;
+      if (s.enterWasSystem && s.systemInjectedPending > 0) s.systemInjectedPending--;
+      s.enterWasSystem = false;
+    }
+    if (d.includes('\x03')) {
+      s.hasDraft = false;
+      s.deliveringUntil = 0;
+      if (s.queue.length > 0) s.interruptedByUser = true;
+    } else if (d.includes('\r') || d.includes('\n')) {
+      s.hasDraft = false;
+      s.interruptedByUser = false;
+      s.startupBlocked = false;
+      s.initialPromptPending = false;
+    } else if (d.includes('\x15') || d === '\x1b') {
+      s.hasDraft = false;
+    } else if (!wasPermBlocked && (s.info.status === 'needs_you' || s.info.status === 'idle')) {
+      const cleaned = d.replaceAll(PASTE_START, '').replaceAll(PASTE_END, '');
+      if (/[^\x00-\x1f\x7f]/.test(cleaned) && !cleaned.startsWith('\x1b')) {
+        s.hasDraft = true;
+      }
+    }
     s.proc.write(d);
     this.apply(s, { type: 'input', data: d });
   }
 
   // Queues text to be pasted into the session once it is idle (see deliverable). False if the session is not running.
-  enqueue(id: string, text: string): boolean {
+  enqueue(id: string, text: string, opts?: EnqueueOptions): boolean {
     const s = this.live.get(id);
     if (!s || s.info.status === 'exited') return false;
-    s.queue.push(text);
+    const system = opts?.system === true;
+    if (!system) {
+      // Explicit human action from UI unfreezes prior Ctrl+C / draft blocks on this session.
+      s.interruptedByUser = false;
+      s.hasDraft = false;
+    }
+    s.queue.push({ text, system, onDelivered: opts?.onDelivered });
     s.info.queued = s.queue.length;
     this.emit({ t: 'session', session: s.info });
     this.queueTimer ??= setInterval(() => this.drain(), QUEUE_TICK_MS);
@@ -429,22 +605,42 @@ export class SessionManager {
   }
 
   private deliver(s: Live, now: number) {
-    const text = s.queue.shift()!;
+    const item = s.queue.shift()!;
+    const { text, system, onDelivered } = item;
     s.lastDeliveryAt = now;
+    s.deliveringUntil = now + DELIVERY_INFLIGHT_MS;
     s.permBlocked = false;
+    if (system) {
+      s.systemInjectedPending++;
+      s.systemInjectedUntil = now + SYSTEM_INJECT_TTL_MS;
+    }
+    const seq = s.inputSeq;
     const frame = pasteFrame(text, s.modes.get(2004) === true, s.info.agent === 'codex' ? CODEX_NEWLINE : '\n');
     try {
       s.proc.write(frame);
     } catch (e) {
       console.warn('[inject]', (e as Error).message);
     }
-    setTimeout(() => {
-      if (s.removed || s.info.status === 'exited') return;
-      try { s.proc.write('\r'); } catch (e) { console.warn('[inject]', (e as Error).message); }
+    if (s.enterTimer) clearTimeout(s.enterTimer);
+    s.enterWasSystem = system;
+    s.enterTimer = setTimeout(() => {
+      s.enterTimer = null;
+      s.enterWasSystem = false;
+      if (s.removed || s.info.status === 'exited' || s.inputSeq !== seq) {
+        s.deliveringUntil = 0;
+        if (system && s.systemInjectedPending > 0) s.systemInjectedPending--;
+        return;
+      }
+      try {
+        s.proc.write('\r');
+        onDelivered?.();
+      } catch (e) {
+        console.warn('[inject]', (e as Error).message);
+      }
     }, ENTER_DELAY_MS);
     s.info.queued = s.queue.length;
     this.emit({ t: 'session', session: s.info });
-    this.log({ kind: 'inject', sessionId: s.info.id, chars: text.length, at: now });
+    this.log({ kind: 'inject', sessionId: s.info.id, chars: text.length, system, at: now });
   }
 
   private dropQueue(s: Live) {
@@ -477,21 +673,62 @@ export class SessionManager {
   }
 
   // Kills the PTY, but leaves a young claude running until it is past its fullscreen health check (CLAUDE_HEALTHY_MS).
+  // On Windows ConPTY, `node-pty`'s `kill()` uses an async `conpty_console_list_agent` fork and does not wait for the
+  // shell process to exit; calling `process.exit(0)` right away then deadlocks inside `conpty.node`'s ThreadSafeFunction
+  // finalizer (`th->join()`). Killing the process tree first with `taskkill.exe` and awaiting `onExit` avoids both
+  // leaked `CREATE_NO_WINDOW` descendants and the exit deadlock.
   private endProc(s: Live): Promise<void> {
-    const kill = () => {
-      if (s.info.exitCode !== null) return;
-      try {
-        s.proc.kill();
-      } catch (e) {
-        console.warn('[kill]', (e as Error).message);
+    const kill = (): Promise<void> => {
+      if (s.info.exitCode !== null) return Promise.resolve();
+      const realWinPty = process.platform === 'win32' && '_agent' in s.proc && Number.isInteger(s.proc.pid) && s.proc.pid > 0;
+      if (!realWinPty) {
+        try {
+          s.proc.kill();
+        } catch (e) {
+          console.warn('[kill]', (e as Error).message);
+        }
+        return Promise.resolve();
       }
+      return new Promise<void>(resolve => {
+        let settled = false;
+        let ptyExited = false;
+        let treeKilled = false;
+        const done = () => {
+          if (settled || !ptyExited || !treeKilled) return;
+          settled = true;
+          clearTimeout(timer);
+          const idx = s.exitWaiters.indexOf(onPtyExit);
+          if (idx >= 0) s.exitWaiters.splice(idx, 1);
+          // Yield one event-loop turn so `conpty.node` finishes `ThreadSafeFunction.Release()` after `onExit`.
+          setImmediate(resolve);
+        };
+        const onPtyExit = () => {
+          ptyExited = true;
+          done();
+        };
+        const timer = setTimeout(() => {
+          ptyExited = true;
+          treeKilled = true;
+          done();
+        }, 3000);
+        timer.unref?.();
+        s.exitWaiters.push(onPtyExit);
+        // Kill the whole ConPTY process tree BEFORE calling `s.proc.kill()` (`ClosePseudoConsole`),
+        // otherwise `ClosePseudoConsole` kills the root shell first and `taskkill /T` misses `CREATE_NO_WINDOW` children.
+        execFile('taskkill.exe', ['/PID', String(s.proc.pid), '/T', '/F'], { windowsHide: true, timeout: 2500 }, () => {
+          try {
+            s.proc.kill();
+          } catch (e) {
+            console.warn('[kill]', (e as Error).message);
+          }
+          treeKilled = true;
+          done();
+        });
+      });
     };
     const wait = s.info.agent === 'claude' ? (s.firstOutAt || Date.now()) + CLAUDE_HEALTHY_MS - Date.now() : 0;
-    if (wait <= 0) {
-      kill();
-      return Promise.resolve();
-    }
-    return new Promise(resolve => setTimeout(() => { kill(); resolve(); }, wait));
+    if (wait <= 0) return kill();
+    return new Promise(resolve => setTimeout(() => { void kill().then(resolve); }, wait));
   }
 
   // Kills the PTY and forgets the session (no further broadcasts for it).
@@ -499,9 +736,14 @@ export class SessionManager {
     this.dead.delete(id);
     const s = this.live.get(id);
     if (!s) return Promise.resolve();
+    this.peerTokens.delete(s.peerToken);
     s.removed = true;
     this.dropQueue(s);
     if (s.quiet) clearTimeout(s.quiet);
+    if (s.enterTimer) {
+      clearTimeout(s.enterTimer);
+      s.enterTimer = null;
+    }
     this.live.delete(id);
     // Killing an already-exited ConPTY makes node-pty's console-list helper print an AttachConsole stack.
     if (s.info.status === 'exited') return Promise.resolve();

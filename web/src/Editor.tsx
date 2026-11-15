@@ -253,6 +253,7 @@ export function CodeEditor({
           syntaxHighlightDeletions: true,
           mergeControls: false,
           collapseUnchanged: { margin: 3, minSize: 4 },
+          diffConfig: { scanLimit: 500, timeout: 150 },
         }),
       );
     } else {
