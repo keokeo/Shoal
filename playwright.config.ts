@@ -5,7 +5,10 @@ import path from 'node:path';
 export const PORT = 47811;
 const out = path.resolve('.tmp/m1');
 // State now persists to state.json; start every run empty. Workers re-load this file, so only the main process clears it.
-if (!process.env.TEST_WORKER_INDEX) fs.rmSync(path.join(out, 'state'), { recursive: true, force: true });
+if (!process.env.TEST_WORKER_INDEX) {
+  fs.rmSync(path.join(out, 'state'), { recursive: true, force: true });
+  fs.rmSync(path.join(out, 'agy-home'), { recursive: true, force: true });
+}
 
 export default defineConfig({
   testDir: 'e2e',
@@ -38,6 +41,8 @@ export default defineConfig({
       // POST /api/open appends the command it would run here instead of starting anything.
       WORKBENCH_OPEN_LOG: path.join(out, 'open-log.jsonl'),
       WORKBENCH_EDITOR: 'C:\\fake\\Code.exe',
+      AGY_HOME_DIR: path.join(out, 'agy-home'),
+      AGY_CONFIG_DIR: path.join(out, 'agy-home', 'antigravity-cli'),
     },
   },
 });

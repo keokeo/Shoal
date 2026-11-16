@@ -4,6 +4,14 @@
 
 ---
 
+## [0.1.17] - 2026-11-16
+
+### 新增与交互改进
+
+- **Antigravity CLI 输出与排版一键优化**：设置弹窗新增「Antigravity CLI 输出与排版优化」卡片，点击「一键优化」→「确定」即可自动备份原配置（`.shoal.bak`）并无损写入 `~/.gemini/antigravity-cli/settings.json`（`verbosity: "low"` 折叠冗长命令刷屏 + `tokyo night` 柔和配色）、全局常驻终端清爽排版与阶段心跳规则（`~/.gemini/config/rules/shoal-output-style.md`，若 `GEMINI.md` 已内置排版规范则自动复用免重复）及内置零 npm 依赖 `fast-tools` 极速检索 MCP（`hooks/fast-tools.mjs`，优先调用 `rg`，未装 `rg` 自动回退纯 Node），完整保留已有模型、权限与其他 MCP 服务；同步新增完整优化原理与手动配置指南 [docs/agy-output-optimization.md](docs/agy-output-optimization.md)。
+
+---
+
 ## [0.1.16] - 2026-11-16
 
 ### 新增功能

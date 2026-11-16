@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePrivacy } from './privacy.ts';
-import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, MobileAdminStatus, MobileConfigPatch, MobileTunnelMode, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
+import type { AgentKind, AgyOptimizeStatus, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, MobileAdminStatus, MobileConfigPatch, MobileTunnelMode, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
 import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
 import { QrCodeSvg } from './QrCode.tsx';
 
@@ -711,6 +711,105 @@ function MobileSettingsSection() {
   );
 }
 
+function AgyOptimizeSection() {
+  const [status, setStatus] = useState<AgyOptimizeStatus | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    getJson<AgyOptimizeStatus>('/api/agy/optimize').then(
+      (s) => { if (alive) setStatus(s); },
+      (e) => { if (alive) setError((e as Error).message); },
+    );
+    return () => { alive = false; };
+  }, []);
+
+  const doneCount = status
+    ? [status.cliSettings.optimized, status.outputRule.optimized, status.fastToolsMcp.optimized].filter(Boolean).length
+    : 0;
+  const pillLabel = status?.optimized ? '已优化' : doneCount > 0 ? '部分启用' : '待优化';
+
+  const apply = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const next = await post<AgyOptimizeStatus>('/api/agy/optimize', {});
+      setStatus(next);
+      setConfirming(false);
+      setNotice('已完成一键优化（新开或重连的 agy 会话立即生效）');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const items = [
+    { ok: status?.cliSettings.optimized ?? false, label: 'CLI 降噪与柔和配色（verbosity: low + tokyo night）' },
+    { ok: status?.outputRule.optimized ?? false, label: '终端清爽排版与阶段心跳规则（防反引号碎块 / 加粗破损 / 链接刷屏）' },
+    { ok: status?.fastToolsMcp.optimized ?? false, label: '零依赖 fast-tools 极速检索 MCP（告别 node -e 与 PowerShell 刷屏）' },
+  ];
+
+  return (
+    <div className="mobile-admin-card" data-testid="agy-optimize-card" style={{ marginTop: '0.75rem' }}>
+      <div className="mobile-admin-card-title">
+        <span>Antigravity CLI 输出与排版优化</span>
+        <span className={`mobile-admin-pill ${status?.optimized ? 'is-on' : ''}`} data-testid="agy-optimize-status">
+          {pillLabel}
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', margin: '0.375rem 0' }}>
+        {items.map((item) => (
+          <div key={item.label} className="mobile-admin-hint" style={{ display: 'flex', gap: '0.375rem', alignItems: 'flex-start' }}>
+            <span style={{ color: item.ok ? 'var(--ok, #74bbac)' : 'inherit', fontWeight: 600 }}>{item.ok ? '✓' : '○'}</span>
+            <span>{item.label}</span>
+          </div>
+        ))}
+      </div>
+      {!confirming ? (
+        <div className="mobile-admin-row">
+          <button
+            type="button"
+            className={status?.optimized ? 'ghost' : 'primary'}
+            data-testid="agy-optimize-btn"
+            disabled={busy || !status}
+            onClick={() => { setNotice(''); setError(''); setConfirming(true); }}
+          >{status?.optimized ? '重新应用优化' : '一键优化'}</button>
+        </div>
+      ) : (
+        <div className="mobile-claim-box" data-testid="agy-optimize-confirm-box">
+          <div className="mobile-admin-hint">
+            将自动备份原配置并无损写入 ~/.gemini 下的 CLI 设置、排版规则与 fast-tools MCP（保留已有模型、权限与其他 MCP；新开或重连会话生效）。
+          </div>
+          <div className="mobile-admin-row" style={{ justifyContent: 'flex-end', marginTop: '0.375rem' }}>
+            <button
+              type="button"
+              className="ghost"
+              data-testid="agy-optimize-cancel"
+              disabled={busy}
+              onClick={() => setConfirming(false)}
+            >取消</button>
+            <button
+              type="button"
+              className="primary"
+              data-testid="agy-optimize-confirm"
+              disabled={busy}
+              onClick={() => void apply()}
+            >{busy ? '优化中…' : '确定'}</button>
+          </div>
+        </div>
+      )}
+      {notice && <div className="mobile-admin-ok" data-testid="agy-optimize-notice">{notice}</div>}
+      {error && <div className="form-error" data-testid="agy-optimize-error">{error}</div>}
+    </div>
+  );
+}
+
 // Changes are saved at once; the checkbox follows the server's value (settings arrive over the WebSocket).
 export function SettingsDialog({ settings, onClose }: { settings: Settings; onClose(): void }) {
   const [busy, setBusy] = useState(false);
@@ -762,6 +861,7 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
         </select>
         {activeAgyDesc && <span className="field-hint">{activeAgyDesc}</span>}
       </label>
+      <AgyOptimizeSection />
       <MobileSettingsSection />
       {error && <div className="form-error" data-testid="settings-error">{error}</div>}
       <div className="actions">

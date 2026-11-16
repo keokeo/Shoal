@@ -1030,6 +1030,8 @@ export function createMobileController(handlers: MobileHandlers) {
       pathname === '/api/clipboard/files' ||
       pathname === '/api/usage' ||
       pathname === '/api/settings' ||
+      pathname === '/api/agy/optimize' ||
+      pathname.startsWith('/api/agy/') ||
       pathname === '/api/projects' ||
       /^\/api\/projects\/[^/]+$/.test(pathname) ||
       /^\/api\/tasks\/[^/]+$/.test(pathname) && method === 'DELETE' ||

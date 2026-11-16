@@ -235,6 +235,28 @@ export interface Settings {
 }
 export const DEFAULT_SETTINGS: Settings = { aiTitles: false };
 
+export interface AgyOptimizeStatus {
+  optimized: boolean;
+  cliSettings: {
+    optimized: boolean;
+    path: string;
+    verbosity?: string;
+    colorScheme?: string;
+  };
+  outputRule: {
+    optimized: boolean;
+    source: 'rule_file' | 'gemini_md' | 'none';
+    path: string;
+  };
+  fastToolsMcp: {
+    optimized: boolean;
+    path: string;
+    scriptPath?: string;
+  };
+  appliedChanges?: string[];
+  backupsCreated?: string[];
+}
+
 export interface Snapshot {
   projects: Project[];
   tasks: Task[];
@@ -295,6 +317,8 @@ export const TASK_COLORS = [
 // GET    /api/projects/:id/raw?path=p    -> binary stream    (image preview only, strict CSP: default-src 'none')
 // PUT    /api/projects/:id/file WriteFileBody -> WriteFileResult (saves UTF-8 text; 409 { code: 'conflict', mtimeMs } on mtime mismatch)
 // POST   /api/projects/:id/discard { path } -> { ok: true }  (restores tracked file to HEAD or deletes untracked file)
+// GET    /api/agy/optimize               -> AgyOptimizeStatus (read-only status of Antigravity CLI output & fast-tools optimization)
+// POST   /api/agy/optimize               -> AgyOptimizeStatus (backs up existing configs to *.shoal.bak and applies non-destructive optimization; 400 on corrupt JSON)
 // POST   /hook  Authorization: Bearer <token>  HookBody -> 204  (called by hooks/notify.mjs, and by hooks/statusline.mjs with the
 //                                                synthetic event 'RateLimits', payload { rate_limits } in claude's status line format
 //                                                ({ five_hour?, seven_day? }, each { used_percentage: 0-100, resets_at: unix seconds })

@@ -32,6 +32,7 @@ import {
   WorkspaceError, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveRawImage, writeFileEntry,
 } from './workspace.ts';
 import { createMobileController } from './mobile.ts';
+import { AgyOptimizeError, applyAgyOptimization, getAgyOptimizeStatus } from './agyOptimize.ts';
 
 const MAX_BODY = 1024 * 1024;
 const MAX_FILE_BODY = 5 * 1024 * 1024;
@@ -878,6 +879,15 @@ export function createApp(cfg: AppConfig) {
       store.setSettings(settings);
       broadcast({ t: 'settings', settings });
       return send(res, 200, settings);
+    }
+    if (method === 'GET' && pathname === '/api/agy/optimize') return send(res, 200, getAgyOptimizeStatus());
+    if (method === 'POST' && pathname === '/api/agy/optimize') {
+      try {
+        return send(res, 200, applyAgyOptimization());
+      } catch (e) {
+        if (e instanceof AgyOptimizeError) throw new HttpError(e.status, e.message);
+        throw e;
+      }
     }
     if (method === 'POST' && pathname === '/api/projects') return send(res, 200, createProject(body));
     if (method === 'POST' && pathname === '/api/tasks') return send(res, 200, createTask(body));
