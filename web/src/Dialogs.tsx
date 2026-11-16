@@ -1,8 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePrivacy } from './privacy.ts';
-import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
+import type { AgentKind, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, MobileAdminStatus, MobileConfigPatch, MobileTunnelMode, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
 import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
+import { QrCodeSvg } from './QrCode.tsx';
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  if (!res.ok) throw new Error(json.error ?? `请求失败 (${res.status})`);
+  return json as T;
+}
+
+async function delJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { method: 'DELETE' });
+  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  if (!res.ok) throw new Error(json.error ?? `请求失败 (${res.status})`);
+  return json as T;
+}
 
 export async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -122,6 +137,580 @@ const AI_TITLES_TIP = [
   '默认关闭。',
 ].join('\n');
 
+const VIA_LABEL: Record<string, string> = { lan: '同 Wi-Fi', tunnel: 'Cloudflare', local: '本机' };
+
+function fmtClock(ts: number): string {
+  const d = new Date(ts);
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function MobileSettingsSection() {
+  const [status, setStatus] = useState<MobileAdminStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [qrIdx, setQrIdx] = useState(0);
+  const [pairCode, setPairCode] = useState('');
+
+  // Draft fields for Tunnel & Webhook forms; secret inputs stay blank unless user replaces them.
+  const [draftOrigin, setDraftOrigin] = useState('');
+  const [draftTunnelEnabled, setDraftTunnelEnabled] = useState(false);
+  const [draftTunnelMode, setDraftTunnelMode] = useState<MobileTunnelMode>('quick');
+  const [draftTunnelToken, setDraftTunnelToken] = useState('');
+  const [draftCfDomain, setDraftCfDomain] = useState('');
+  const [draftCfAud, setDraftCfAud] = useState('');
+  const [draftFeishuEnabled, setDraftFeishuEnabled] = useState(false);
+  const [draftFeishuWebhook, setDraftFeishuWebhook] = useState('');
+  const [draftFeishuSecret, setDraftFeishuSecret] = useState('');
+  const [draftQuiet, setDraftQuiet] = useState(true);
+  const hydrated = useRef(false);
+  const statusSeq = useRef(0);
+  const actionQueue = useRef<Promise<void>>(Promise.resolve());
+  const inFlight = useRef(0);
+
+  const applyStatus = useCallback((s: MobileAdminStatus, forceSyncDrafts = false, syncControls = false) => {
+    setStatus(s);
+    if (!hydrated.current || forceSyncDrafts) {
+      hydrated.current = true;
+      setDraftOrigin(s.config.publicOrigin);
+      setDraftTunnelEnabled(s.config.tunnelEnabled);
+      setDraftTunnelMode(s.config.tunnelMode);
+      setDraftCfDomain(s.config.cfAccessTeamDomain);
+      setDraftCfAud(s.config.cfAccessAud);
+      setDraftFeishuEnabled(s.config.feishuEnabled);
+      setDraftQuiet(s.config.quietWhenDesktopActive);
+    } else if (syncControls) {
+      setDraftTunnelEnabled(s.config.tunnelEnabled);
+      setDraftTunnelMode(s.config.tunnelMode);
+      setDraftFeishuEnabled(s.config.feishuEnabled);
+      setDraftQuiet(s.config.quietWhenDesktopActive);
+    }
+  }, []);
+
+  const refresh = useCallback(async (syncControls = false) => {
+    if (!syncControls && inFlight.current > 0) return;
+    const mySeq = ++statusSeq.current;
+    try {
+      const s = await getJson<MobileAdminStatus>('/api/mobile/admin/status');
+      if (mySeq !== statusSeq.current || inFlight.current > 0) return;
+      applyStatus(s, false, syncControls);
+    } catch (e) {
+      if (mySeq === statusSeq.current) setError((e as Error).message);
+    }
+  }, [applyStatus]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const needPoll = Boolean(status?.activePair) || status?.tunnel.state === 'starting';
+  useEffect(() => {
+    if (!needPoll) return;
+    const t = setInterval(() => void refresh(false), 1000);
+    return () => clearInterval(t);
+  }, [needPoll, refresh]);
+
+  const runQueued = (task: () => Promise<void>, refreshOnErr = false) => {
+    inFlight.current += 1;
+    statusSeq.current += 1;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    let failed = false;
+    actionQueue.current = actionQueue.current.then(async () => {
+      try {
+        await task();
+      } catch (e) {
+        failed = true;
+        setError((e as Error).message);
+      } finally {
+        inFlight.current = Math.max(0, inFlight.current - 1);
+        setBusy(inFlight.current > 0);
+        if (failed && refreshOnErr && inFlight.current === 0) {
+          void refresh(true);
+        }
+      }
+    });
+  };
+
+  const runAction = (fn: () => Promise<MobileAdminStatus>, okMsg = '', syncDrafts = false) => {
+    runQueued(async () => {
+      const s = await fn();
+      statusSeq.current += 1;
+      applyStatus(s, syncDrafts);
+      if (okMsg) setNotice(okMsg);
+    }, true);
+  };
+
+  const patchMobile = (patch: MobileConfigPatch, okMsg = '', syncDrafts = false) => {
+    setStatus((cur) => (cur ? {
+      ...cur,
+      config: {
+        ...cur.config,
+        ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+        ...(patch.lanEnabled !== undefined ? { lanEnabled: patch.lanEnabled } : {}),
+        ...(patch.keepAwake !== undefined ? { keepAwake: patch.keepAwake } : {}),
+        ...(patch.tunnelEnabled !== undefined ? { tunnelEnabled: patch.tunnelEnabled } : {}),
+        ...(patch.tunnelMode !== undefined ? { tunnelMode: patch.tunnelMode } : {}),
+        ...(patch.feishuEnabled !== undefined ? { feishuEnabled: patch.feishuEnabled } : {}),
+        ...(patch.quietWhenDesktopActive !== undefined ? { quietWhenDesktopActive: patch.quietWhenDesktopActive } : {}),
+      },
+    } : cur));
+    runAction(() => post<MobileAdminStatus>('/api/mobile/admin/config', patch), okMsg, syncDrafts);
+  };
+
+  const cfg = status?.config;
+  const pair = status?.activePair ?? null;
+  const qrList = pair?.qrUrls ?? [];
+  const safeQrIdx = qrIdx < qrList.length ? qrIdx : 0;
+  const selectedQr = qrList[safeQrIdx];
+  const listenPort = status?.actualPort ?? cfg?.port ?? 47801;
+
+  return (
+    <div className="mobile-admin" data-testid="mobile-settings-section">
+      <div className="mobile-admin-head">
+        <h4>手机远程连接（Android / 浏览器）</h4>
+        <span className={`mobile-admin-pill ${status?.listening ? 'is-on' : ''}`}>
+          {!cfg ? '加载中…' : !cfg.enabled ? '未开启' : status?.listening ? `监听中 :${listenPort}` : '启动失败'}
+        </span>
+      </div>
+
+      {cfg && (
+        <>
+          <div className="mobile-admin-card">
+            <label className="check-row">
+              <input
+                type="checkbox"
+                data-testid="mobile-enable-toggle"
+                checked={cfg.enabled}
+                onChange={(e) => patchMobile({ enabled: e.target.checked })}
+              />
+              开启手机远程网关（独立端口 {listenPort}，每次访问强校验设备 Cookie）
+            </label>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                data-testid="mobile-lan-toggle"
+                checked={cfg.lanEnabled}
+                onChange={(e) => patchMobile({ lanEnabled: e.target.checked })}
+              />
+              允许同局域网 Wi-Fi 访问
+            </label>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                data-testid="mobile-keepawake-toggle"
+                checked={cfg.keepAwake}
+                onChange={(e) => patchMobile({ keepAwake: e.target.checked })}
+              />
+              手机网关开启期间阻止电脑自动休眠 {status?.powerAwake ? '（防睡眠已生效）' : ''}
+            </label>
+            {cfg.enabled && status && (
+              <div className="mobile-admin-hint">
+                {status.lanUrls.length > 0 ? `局域网入口：${status.lanUrls.join(' · ')}` : '当前仅本机 127.0.0.1 监听（出门可搭配下方 Cloudflare 隧道）'}
+              </div>
+            )}
+          </div>
+
+          <div className="mobile-admin-card">
+            <div className="mobile-admin-card-title">
+              <span>扫码配对新手机</span>
+              <div className="mobile-admin-row">
+                {pair && (
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy}
+                    onClick={() => void runAction(() => post<MobileAdminStatus>('/api/mobile/admin/pair/cancel', {}))}
+                  >取消配对</button>
+                )}
+                <button
+                  type="button"
+                  data-testid="mobile-pair-start"
+                  disabled={busy || !cfg.enabled}
+                  onClick={() => {
+                    setPairCode('');
+                    setQrIdx(0);
+                    void runAction(() => post<MobileAdminStatus>('/api/mobile/admin/pair/start', {}));
+                  }}
+                >{pair ? '刷新二维码' : '发起扫码配对'}</button>
+              </div>
+            </div>
+
+            {!pair && (
+              <div className="mobile-admin-hint">
+                配对采用 3 分钟一次性二维码 + 手机端认领后桌面输入 6 位确认码（连续 3 次输错自动作废）。
+              </div>
+            )}
+
+            {pair && selectedQr && (
+              <div className="mobile-pair-wrap">
+                <QrCodeSvg value={selectedQr.url} size={156} testId="mobile-pair-qr" />
+                <div className="mobile-pair-meta">
+                  {qrList.length > 1 && (
+                    <div className="mobile-admin-tabs">
+                      {qrList.map((item, idx) => (
+                        <button
+                          key={item.url}
+                          type="button"
+                          className={`mobile-admin-tab ${idx === safeQrIdx ? 'on' : ''}`}
+                          onClick={() => setQrIdx(idx)}
+                        >{item.label}</button>
+                      ))}
+                    </div>
+                  )}
+                  <code className="mobile-pair-url" data-testid="mobile-pair-url">{selectedQr.url}</code>
+                  <div className="mobile-admin-row">
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void navigator.clipboard?.writeText(selectedQr.url).then(() => setNotice('配对链接已复制')).catch(() => {})}
+                    >复制链接</button>
+                    <span className="mobile-admin-hint">
+                      {pair.status === 'waiting_scan'
+                        ? '等待手机扫码打开…'
+                        : `已认领（剩余 ${pair.attemptsLeft} 次校验机会）`}
+                    </span>
+                  </div>
+
+                  {pair.status === 'claimed' && (
+                    <div className="mobile-claim-box">
+                      <div className="mobile-admin-card-title">
+                        <span>设备：{pair.deviceName || 'Android 手机'}</span>
+                        <span className="mobile-admin-hint">{pair.claimedIp}</span>
+                      </div>
+                      <div className="mobile-admin-row">
+                        <input
+                          data-testid="mobile-pair-code-input"
+                          value={pairCode}
+                          maxLength={6}
+                          inputMode="numeric"
+                          placeholder="输入手机显示的 6 位配对码"
+                          onChange={(e) => setPairCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        />
+                        <button
+                          type="button"
+                          className="primary"
+                          data-testid="mobile-pair-approve"
+                          disabled={busy || pairCode.trim().length !== 6}
+                          onClick={() => void runAction(async () => {
+                            const s = await post<MobileAdminStatus>('/api/mobile/admin/pair/approve', { code: pairCode.trim() });
+                            setPairCode('');
+                            return s;
+                          }, '手机配对已放行')}
+                        >确认放行</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="mobile-admin-card">
+            <div className="mobile-admin-card-title">
+              <span>已配对设备（{status.devices.length}）</span>
+              {status.devices.length > 0 && (
+                <button
+                  type="button"
+                  className="ghost"
+                  data-testid="mobile-devices-revoke-all"
+                  disabled={busy}
+                  onClick={() => void runAction(() => post<MobileAdminStatus>('/api/mobile/admin/devices/revoke-all', {}), '已撤销全部设备')}
+                >全部踢出</button>
+              )}
+            </div>
+            <div className="mobile-device-list" data-testid="mobile-device-list">
+              {status.devices.length === 0 ? (
+                <div className="mobile-admin-hint">暂无已配对手机</div>
+              ) : (
+                status.devices.map((d) => (
+                  <div key={d.id} className="mobile-device-item">
+                    <span className={`mobile-device-dot ${d.online ? 'on' : ''}`} title={d.online ? '在线' : '离线'} />
+                    <div className="mobile-device-info">
+                      <span className="mobile-device-name">{d.name}</span>
+                      <span className="mobile-device-sub">
+                        {VIA_LABEL[d.via] ?? d.via} · {d.lastIp || '未知 IP'} · 最近活跃 {fmtClock(d.lastSeenAt)}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="ghost"
+                      data-testid="mobile-device-revoke"
+                      disabled={busy}
+                      onClick={() => void runAction(() => delJson<MobileAdminStatus>(`/api/mobile/admin/devices/${encodeURIComponent(d.id)}`), `已撤销 ${d.name}`)}
+                    >撤销</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="mobile-admin-card">
+            <div className="mobile-admin-card-title">
+              <span>出门公网（Cloudflare Tunnel / 外部 HTTPS）</span>
+              <span className={`mobile-admin-pill ${status.tunnel.state === 'running' ? 'is-on' : status.tunnel.state === 'error' ? 'is-warn' : ''}`}>
+                {status.tunnel.state === 'running'
+                  ? `已连通（${status.tunnel.connectedEdges} 节点）`
+                  : status.tunnel.state === 'starting'
+                    ? '正在建链…'
+                    : status.tunnel.state === 'error'
+                      ? '隧道异常'
+                      : '未启动'}
+              </span>
+            </div>
+            <div className="mobile-admin-tabs">
+              <button
+                type="button"
+                data-testid="mobile-tunnel-mode-quick"
+                className={`mobile-admin-tab ${draftTunnelMode === 'quick' ? 'on' : ''}`}
+                disabled={busy}
+                onClick={() => setDraftTunnelMode('quick')}
+              >免账号临时隧道（trycloudflare）</button>
+              <button
+                type="button"
+                data-testid="mobile-tunnel-mode-named"
+                className={`mobile-admin-tab ${draftTunnelMode === 'named' ? 'on' : ''}`}
+                disabled={busy}
+                onClick={() => setDraftTunnelMode('named')}
+              >固定域名 / 外部 HTTPS</button>
+            </div>
+
+            {draftTunnelMode === 'quick' ? (
+              <>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    data-testid="mobile-tunnel-toggle"
+                    checked={cfg.tunnelMode === 'quick' && draftTunnelEnabled}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setDraftTunnelEnabled(checked);
+                      patchMobile({ tunnelMode: 'quick', tunnelEnabled: checked }, '', false);
+                    }}
+                  />
+                  启动免注册临时公网隧道（每次重启生成新 https://*.trycloudflare.com 地址）
+                </label>
+                {status.tunnel.quickUrl && (
+                  <div className="mobile-admin-row">
+                    <code className="mobile-pair-url" data-testid="mobile-quick-url">{status.tunnel.quickUrl}</code>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void navigator.clipboard?.writeText(status.tunnel.quickUrl!).then(() => setNotice('临时隧道地址已复制')).catch(() => {})}
+                    >复制地址</button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <label>
+                  <span>公网访问域名 Origin（用于生成外网二维码与 Origin/Host 校验）</span>
+                  <input
+                    type="url"
+                    data-testid="mobile-public-origin"
+                    value={draftOrigin}
+                    placeholder="https://shoal.example.com"
+                    onChange={(e) => setDraftOrigin(e.target.value)}
+                  />
+                </label>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    data-testid="mobile-tunnel-toggle"
+                    checked={cfg.tunnelMode === 'named' && draftTunnelEnabled}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setDraftTunnelEnabled(checked);
+                      patchMobile({ tunnelMode: 'named', tunnelEnabled: checked }, '', false);
+                    }}
+                  />
+                  随手机网关自动启动 cloudflared 隧道
+                </label>
+                <label>
+                  <span>Tunnel Token <span className="opt">（通过环境变量注入子进程，留空保持现有凭据）</span></span>
+                  <input
+                    type="password"
+                    data-testid="mobile-tunnel-token"
+                    value={draftTunnelToken}
+                    placeholder={cfg.hasTunnelToken ? '已保存 Tunnel Token（留空则保持不变）' : '粘贴 Token 或 cloudflared service install eyJ...'}
+                    onChange={(e) => setDraftTunnelToken(e.target.value)}
+                  />
+                </label>
+                <details>
+                  <summary>可选第二道防线：Cloudflare Access 边缘 JWT 校验</summary>
+                  <div className="mobile-admin-card" style={{ marginTop: '0.375rem' }}>
+                    <label>
+                      <span>Team Domain</span>
+                      <input
+                        data-testid="mobile-cf-domain"
+                        value={draftCfDomain}
+                        placeholder="your-team.cloudflareaccess.com"
+                        onChange={(e) => setDraftCfDomain(e.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Application AUD</span>
+                      <input
+                        data-testid="mobile-cf-aud"
+                        value={draftCfAud}
+                        placeholder="填写 Cloudflare Access Application AUD"
+                        onChange={(e) => setDraftCfAud(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                </details>
+                <div className="mobile-admin-row">
+                  <button
+                    type="button"
+                    data-testid="mobile-tunnel-save"
+                    disabled={busy}
+                    onClick={() => {
+                      const patch: MobileConfigPatch = {
+                        tunnelMode: 'named',
+                        publicOrigin: draftOrigin.trim(),
+                        tunnelEnabled: cfg.tunnelMode === 'named' && draftTunnelEnabled,
+                        cfAccessTeamDomain: draftCfDomain.trim(),
+                        cfAccessAud: draftCfAud.trim(),
+                      };
+                      if (draftTunnelToken.trim()) patch.tunnelToken = draftTunnelToken.trim();
+                      void runAction(async () => {
+                        const s = await post<MobileAdminStatus>('/api/mobile/admin/config', patch);
+                        setDraftTunnelToken('');
+                        return s;
+                      }, '公网隧道设置已保存', true);
+                    }}
+                  >保存隧道配置</button>
+                  {cfg.hasTunnelToken && (
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={busy}
+                      onClick={() => {
+                        setDraftTunnelToken('');
+                        patchMobile({ tunnelEnabled: false, tunnelToken: '' }, 'Tunnel Token 已清除', true);
+                      }}
+                    >清除 Token</button>
+                  )}
+                </div>
+              </>
+            )}
+            <div className="mobile-admin-hint">
+              {draftTunnelMode === 'quick'
+                ? `无需账号与域名，自动转发至 127.0.0.1:${listenPort}（生成地址后上方二维码同步提供外网入口）`
+                : `Zero Trust 后台 Public Hostname 请指向：http://127.0.0.1:${listenPort}`}
+              {status.tunnel.binaryPath ? ' · 已检测到 cloudflared' : ' · 未检测到 cloudflared.exe，请先安装或加入 PATH'}
+              {status.tunnel.lastError ? ` · 最近报错：${status.tunnel.lastError}` : ''}
+            </div>
+          </div>
+
+          <div className="mobile-admin-card">
+            <div className="mobile-admin-card-title">
+              <span>锁屏提醒（飞书 / Discord / Slack / Telegram / Webhook）</span>
+              <span className={`mobile-admin-pill ${cfg.feishuEnabled ? 'is-on' : ''}`}>
+                {cfg.feishuEnabled ? '已启用' : '未启用'}
+              </span>
+            </div>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                data-testid="mobile-feishu-toggle"
+                checked={draftFeishuEnabled}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setDraftFeishuEnabled(checked);
+                  patchMobile({ feishuEnabled: checked }, '', false);
+                }}
+              />
+              任务需要人工授权 / 额度耗尽 / 待验收时推送通知
+            </label>
+            <label>
+              <span>推送 Webhook 地址</span>
+              <input
+                type="url"
+                data-testid="mobile-feishu-webhook"
+                value={draftFeishuWebhook}
+                placeholder={cfg.feishuWebhookUrlMasked || '支持飞书、Discord、Slack、Telegram 或任意公网 HTTPS Webhook'}
+                onChange={(e) => setDraftFeishuWebhook(e.target.value)}
+              />
+            </label>
+            <label>
+              <span>安全加签密钥（Secret） <span className="opt">（飞书加签或通用 HMAC-SHA256 签名；其他平台留空）</span></span>
+              <input
+                type="password"
+                data-testid="mobile-feishu-secret"
+                value={draftFeishuSecret}
+                placeholder={cfg.hasFeishuSecret ? '已保存加签密钥（留空则保持不变）' : '可选，飞书开启加签或自建接收端校验时填写'}
+                onChange={(e) => setDraftFeishuSecret(e.target.value)}
+              />
+            </label>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                data-testid="mobile-feishu-quiet"
+                checked={draftQuiet}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setDraftQuiet(checked);
+                  patchMobile({ quietWhenDesktopActive: checked }, '', false);
+                }}
+              />
+              最近 60 秒内桌面端有操作时静默推送
+            </label>
+            <div className="mobile-admin-row">
+              <button
+                type="button"
+                data-testid="mobile-feishu-save"
+                disabled={busy}
+                onClick={() => {
+                  const patch: MobileConfigPatch = {
+                    feishuEnabled: draftFeishuEnabled,
+                    quietWhenDesktopActive: draftQuiet,
+                  };
+                  if (draftFeishuWebhook.trim()) patch.feishuWebhookUrl = draftFeishuWebhook.trim();
+                  if (draftFeishuSecret.trim()) patch.feishuSecret = draftFeishuSecret.trim();
+                  void runAction(async () => {
+                    const s = await post<MobileAdminStatus>('/api/mobile/admin/config', patch);
+                    setDraftFeishuWebhook('');
+                    setDraftFeishuSecret('');
+                    return s;
+                  }, '通知设置已保存', true);
+                }}
+              >保存通知设置</button>
+              <button
+                type="button"
+                className="ghost"
+                data-testid="mobile-feishu-test"
+                disabled={busy}
+                onClick={() => {
+                  runQueued(async () => {
+                    await post<{ ok: true }>('/api/mobile/admin/notify/test', {});
+                    setNotice('测试通知已发送');
+                  });
+                }}
+              >发送测试通知</button>
+              {(cfg.feishuWebhookUrlMasked || cfg.hasFeishuSecret) && (
+                <button
+                  type="button"
+                  className="ghost"
+                  data-testid="mobile-feishu-clear"
+                  disabled={busy}
+                  onClick={() => {
+                    setDraftFeishuWebhook('');
+                    setDraftFeishuSecret('');
+                    patchMobile({ feishuEnabled: false, feishuWebhookUrl: '', feishuSecret: '' }, '通知配置已清除', true);
+                  }}
+                >清除通知</button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {notice && <div className="mobile-admin-ok" data-testid="mobile-settings-notice">{notice}</div>}
+      {error && <div className="form-error" data-testid="mobile-settings-error">{error}</div>}
+    </div>
+  );
+}
+
 // Changes are saved at once; the checkbox follows the server's value (settings arrive over the WebSocket).
 export function SettingsDialog({ settings, onClose }: { settings: Settings; onClose(): void }) {
   const [busy, setBusy] = useState(false);
@@ -173,6 +762,7 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
         </select>
         {activeAgyDesc && <span className="field-hint">{activeAgyDesc}</span>}
       </label>
+      <MobileSettingsSection />
       {error && <div className="form-error" data-testid="settings-error">{error}</div>}
       <div className="actions">
         <button type="button" data-testid="settings-close" onClick={onClose}>关闭</button>
@@ -212,7 +802,7 @@ export function ProjectDialog({ onClose, onCreated }: { onClose(): void; onCreat
       <label>名称<input data-testid="project-name" data-private="" value={name} onChange={(e) => setName(e.target.value)} /></label>
       <label>路径
         <div className="path-row">
-          <input data-testid="project-path" data-private="" value={path} placeholder="G:\Workspace\xxx" onChange={(e) => setPath(e.target.value)} />
+          <input data-testid="project-path" data-private="" value={path} placeholder="C:\Projects\my-app" onChange={(e) => setPath(e.target.value)} />
           <button type="button" data-testid="project-browse" onClick={() => setBrowsing((b) => !b)}>浏览…</button>
         </div>
       </label>

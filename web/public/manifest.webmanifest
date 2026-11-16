@@ -1,0 +1,19 @@
+{
+  "name": "Shoal 遥控台",
+  "short_name": "Shoal",
+  "description": "Agent Workbench 手机端遥控台与应急终端",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#14161a",
+  "theme_color": "#14161a",
+  "icons": [
+    {
+      "src": "/shoal-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

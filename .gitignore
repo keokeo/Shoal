@@ -4,3 +4,5 @@ dist/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 desktop/bundle/
+.env
+.env.*

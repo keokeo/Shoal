@@ -31,7 +31,7 @@ const sessions = new SessionManager({ port, token, stateDir });
 const store = createFileStore(path.join(stateDir, 'state.json'));
 sessions.restore(store.sessions());
 const usage = createUsage({ stateDir, source: store });
-const { server } = createApp({ port, token, store, sessions, stateDir, usage, onShutdown: () => shutdown() });
+const { server, mobile } = createApp({ port, token, store, sessions, stateDir, usage, onShutdown: () => shutdown() });
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`Shoal on http://127.0.0.1:${port}`);
@@ -52,7 +52,7 @@ const shutdown = () => {
   stopping = true;
   server.close();
   setTimeout(() => process.exit(0), 12_000).unref();
-  void sessions.killAll().then(() => process.exit(0));
+  void Promise.allSettled([mobile.close(), sessions.killAll()]).then(() => process.exit(0));
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

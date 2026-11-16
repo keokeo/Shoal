@@ -2,7 +2,7 @@
 
 English | [简体中文](v1-spec.md)
 
-> The project was originally called Agent Workbench. This is the design record from development; the Chinese original calls the author by the nickname "虾哥".
+> The project was originally called Agent Workbench. This is the early design record from development.
 
 Status: draft; M0 technical validation passed (2026-11-08, report in `.tmp/m0/REPORT.md`); M1 passed (2026-11-08, see `.tmp/m1/RUN.md`); M2 passed (2026-11-09, see `.tmp/m2/RUN.md`)
 
@@ -172,7 +172,7 @@ Every milestone must save its test artifacts (commands run, inputs, logs, screen
 
 - **xterm.js plus ConPTY rendering and Chinese input methods**: verified in M0.
 - **Codex hooks need the author to grant trust once**: as long as any hook is still untrusted, a review dialog appears at every launch; the workbench recognizes it and hands it to the author.
-- **agy's hook path cannot contain spaces**: because quotes cannot be used in the command. The current install path `G:\Workspace\agent-workbench` satisfies this; check it at startup.
+- **agy's hook path cannot contain spaces**: because quotes cannot be used in the command. Keep the install path free of spaces (for example `C:\Projects\shoal`); the server checks this at startup.
 - **No quota-exhaustion samples for Codex and agy**: the detection rules are written for Claude only for now, and the other two will be added once samples are collected in real use.
 - **CLI upgrades changing output formats and breaking terminal analysis**: hence hooks come first and terminal analysis is only a fallback. Codex's startup update check must be turned off.
 

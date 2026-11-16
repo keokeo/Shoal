@@ -2,13 +2,13 @@
 
 [English](v1-spec.en.md) | 简体中文
 
-> 项目原名 Agent Workbench，本文是开发时的设计记录，文中的“虾哥”指作者。
+> 项目原名 Agent Workbench，本文保留了早期的开发设计记录。
 
 状态：草案；M0 技术验证已通过（2026-11-08，报告见 `.tmp/m0/REPORT.md`）；M1 已通过（2026-11-08，见 `.tmp/m1/RUN.md`）；M2 已通过（2026-11-09，见 `.tmp/m2/RUN.md`）
 
 ## 1. 要解决的问题
 
-虾哥平时同时开 3–9 个 agent 会话（Claude Code、Codex、agy），分布在多个项目里。现状的痛点：
+开发者平时同时开 3–9 个 agent 会话（Claude Code、Codex、agy），分布在多个项目里。现状的痛点：
 
 1. 终端分屏越多，每屏显示越少；开多个窗口又挤满任务栏。
 2. 窗口长得太像，焦点没切过去，指令发错会话。
@@ -17,9 +17,9 @@
 
 ## 2. 定位
 
-本机运行的网页工作台，以任务为中心。虾哥负责派活和验收，agent 从头到尾负责一个任务，中途的开发和测试过程虾哥不关心。
+本机运行的网页工作台，以任务为中心。用户负责派活和验收，agent 从头到尾负责一个任务，中途的开发和测试过程无需逐一干预。
 
-第一版由虾哥派活。参考 DeepSeek super-agent 的分层：虾哥担任派活的 Router 层，各 agent 会话是干活的 Worker 层。
+第一版由用户手动派活。参考 DeepSeek super-agent 的分层：用户担任派活的 Router 层，各 agent 会话是干活的 Worker 层。
 
 ## 3. 硬性约束
 
@@ -84,13 +84,13 @@
 | agy | `agy.exe` | `agy.exe --conversation <id>` | hook payload 的 `conversationId` |
 
 - 环境变量：注入 `WORKBENCH_SESSION_ID`、`WORKBENCH_PORT`、`WORKBENCH_HOOK_TOKEN`；删掉从父进程继承来的 `CLAUDECODE`、`CLAUDE_CODE_*`、`CODEX_SANDBOX*`、`CODEX_THREAD*`、`AGY_SESSION*`，免得被识别成嵌套会话。
-- **启动阶段的对话框不能盲答**：信任目录（Claude 的默认选项是 "No, exit"）、Codex 的 "Hooks need review"、更新提示、登录提示。工作台识别出这类对话框后，把会话放进「需要你」，由虾哥处理。
+- **启动阶段的对话框不能盲答**：信任目录（Claude 的默认选项是 "No, exit"）、Codex 的 "Hooks need review"、更新提示、登录提示。工作台识别出这类对话框后，把会话放进「需要你」，由用户处理。
 
 ### 6.3 状态检测：hooks 为主，终端输出为辅
 
 - **每次启动时注入 hooks，不改全局 hooks 文件**。三家都执行 `node <workbench>/hooks/notify.mjs <agent> <event>`，这个脚本把 payload POST 到 `127.0.0.1:<port>/hook`：
   - Claude：`--settings <tmp.json>`，内容为 `{hooks:{Stop:[{hooks:[{type:"command",command,timeout}]}], ...}}`。会和用户已有的 hooks 合并，不覆盖。
-  - Codex：`-c 'hooks.<Event>=[{hooks=[{type="command",command=...,timeout=5}]}]'`。**第一次需要虾哥在 `/hooks` 里信任**；信任记录的 key 是 `<session-flags>:<event>:0:0`，跟具体会话无关，信任一次就一直有效。不使用 `--dangerously-bypass-hook-trust`，因为它会连带执行用户自己没信任的 hooks。
+  - Codex：`-c 'hooks.<Event>=[{hooks=[{type="command",command=...,timeout=5}]}]'`。**第一次需要用户在 `/hooks` 里信任**；信任记录的 key 是 `<session-flags>:<event>:0:0`，跟具体会话无关，信任一次就一直有效。不使用 `--dangerously-bypass-hook-trust`，因为它会连带执行用户自己没信任的 hooks。
   - agy：`--add-dir <dir>`，dir 下放 `.agents/hooks.json`，格式为 `{workbench:{Stop:[{type:"command",command,timeout}]}}`。agy 通过 `cmd /c` 执行命令，**命令里不能带引号**，所以工作台的安装路径不能含空格。
 - 事件映射：
   - Claude：`Stop`、`StopFailure` 视为停下；`Notification`、`PermissionRequest` 视为在等你；`UserPromptSubmit`、`PreToolUse` 视为在工作。
@@ -115,28 +115,28 @@
 ### 6.5 交接卡片（换 agent 或开新会话时用）
 
 - **数据来源**：任务需求、最近一次结果卡片、反馈记录，以及旧会话的原始记录。
-- **生成方式**：用一个还有额度、比较便宜的模型读取上面这些内容，写出交接卡片，包括目标、已完成、正在做的、关键决策、踩过的坑、下一步、必须先读的文件。这是一次短调用，虾哥已经同意这部分消耗。
+- **生成方式**：用一个还有额度、比较便宜的模型读取上面这些内容，写出交接卡片，包括目标、已完成、正在做的、关键决策、踩过的坑、下一步、必须先读的文件。这是一次短调用，仅在触发换 agent 时消耗少量额度。
 - **按接手模型的能力分级**：能力强的模型只拿卡片和原始记录的路径；能力弱一些的模型再加上必读文件清单、一句话写清楚的下一步和验收方法。
 - **参考 T3 Code**：生成交接卡片失败时退一步，按 token 预算选取原始记录：先保留第一条和最后一条需求，再从最近的对话往前补，并标明哪些内容被省略了。
 
 M3 实现（`server/handoff.ts`、`server/transcript.ts`、`POST /api/tasks/:id/switch`）：
 - **生成器就是接手的 agent**，用它的 headless 模式跑一次短调用。这样不需要另配“便宜模型”的凭据，接手方有额度就一定能生成：
   - claude：`claude.exe -p --model haiku --tools "" --no-session-persistence`，prompt 走 stdin；
-  - codex：`codex.js exec --ephemeral --skip-git-repo-check -s read-only -c model_reasoning_effort="low" -o <file> -`，会触发虾哥自己的 codex hooks（无害）；
+  - codex：`codex.js exec --ephemeral --skip-git-repo-check -s read-only -c model_reasoning_effort="low" -o <file> -`，会触发用户本机已有的 codex hooks（无害）；
   - agy：`agy.exe -p <prompt> --effort low --print-timeout 2m --disable-slash-commands`（不读 stdin）。
   - 超时 120 秒；失败或输出为空时用兜底卡片。
-- **生成器的输入**：任务需求、最近的结果卡片、上一张交接卡片、反馈和转发记录、虾哥的补充说明，加上从旧会话 transcript（claude/codex 的 jsonl、agy 的 `transcript_full.jsonl`）摘录的对话。摘录保留第一条和最后一条需求，再从最近往前补，标出省略了多少条。整个 prompt 不超过 20000 字符。
+- **生成器的输入**：任务需求、最近的结果卡片、上一张交接卡片、反馈和转发记录、用户的补充说明，加上从旧会话 transcript（claude/codex 的 jsonl、agy 的 `transcript_full.jsonl`）摘录的对话。摘录保留第一条和最后一条需求，再从最近往前补，标出省略了多少条。整个 prompt 不超过 20000 字符。
 - **不做能力分级**：三家接手的都是主力模型，卡片统一包含目标、已完成、正在做的、关键决策、踩过的坑、下一步、必须先读的文件、验收方法。
 - **兜底卡片**：以“（自动整理失败……）”开头，内容是任务需求、最近的结果（6000 字以内）、最近 3 条反馈和对话摘录（12000 字以内），界面提示“已按记录摘录”。
-- **新会话的第一条消息**：说明从谁手里接过来、为什么换（额度用完 / 虾哥决定换人），然后是交接卡片、虾哥的补充和旧 transcript 路径（让它按需去查，不要整份读）。超过 8000 字符时照常写进 prompt 文件。
+- **新会话的第一条消息**：说明从谁手里接过来、为什么换（额度用完 / 用户决定换人），然后是交接卡片、用户的补充和旧 transcript 路径（让它按需去查，不要整份读）。超过 8000 字符时照常写进 prompt 文件。
 - 同一任务同时只能有一个换 agent 请求（第二个返回 409）；生成期间任务被删除返回 404，不留下新会话。交接卡片存为 `kind: handoff`，`meta` 为 `{from, to, generated}`，在面板顶部显示成可展开的细条。
 
 ### 6.6 往会话里发指令（注入卡片、转发、反馈）
 
-参考 Parallel Code 的 `writeAgentPrompt`：先用 bracketed paste 把整段内容贴进去，等一下再单独发一个回车。如果 agent 正在忙、虾哥有没发出去的草稿、或者虾哥最近 5 秒在打字，就先排队，过后再发。
+参考 Parallel Code 的 `writeAgentPrompt`：先用 bracketed paste 把整段内容贴进去，等一下再单独发一个回车。如果 agent 正在忙、用户有没发出去的草稿、或者用户最近 5 秒在打字，就先排队，过后再发。
 
 M2 实现（`server/sessions.ts`）：
-- 投递条件：状态为「需要你」至少 1.5 秒；没有权限提示；虾哥 5 秒内没在该会话打字；距上次投递至少 2 秒。每 250ms 检查一次。
+- 投递条件：状态为「需要你」至少 1.5 秒；没有权限提示；用户 5 秒内没在该会话打字；距上次投递至少 2 秒。每 250ms 检查一次。
 - 粘贴：粘贴后 300ms 再单独发 `\r`。
 - 换行：
   - 粘贴里不用 `\r`，因为 Codex 在粘贴里遇到 `\r` 也会提交。
@@ -171,8 +171,8 @@ M3 转发（`POST /api/cards/:id/forward`）：结果卡片的「转发」可以
 ## 8. 风险
 
 - **xterm.js 加 ConPTY 的显示和中文输入法**：M0 已验证通过。
-- **Codex 的 hooks 需要虾哥信任一次**：只要还有未信任的 hook，每次启动都会弹审核框；工作台识别出来后交给虾哥处理。
-- **agy 的 hook 路径不能含空格**：因为命令里不能加引号。目前的安装路径 `G:\Workspace\agent-workbench` 满足要求，启动时要检查一下。
+- **Codex 的 hooks 需要用户信任一次**：只要还有未信任的 hook，每次启动都会弹审核框；工作台识别出来后交给用户处理。
+- **agy 的 hook 路径不能含空格**：因为命令里不能加引号。安装路径需避免含空格（如 `C:\Projects\shoal`），启动时会自动检查一下。
 - **Codex 和 agy 的额度耗尽样本缺失**：识别规则先只按 Claude 的写，其他两家等实际使用中采到样本再补。
 - **CLI 升级后输出格式变化，导致终端分析失效**：所以以 hooks 为主，终端分析只作兜底。Codex 要关掉启动时的更新检查。
 

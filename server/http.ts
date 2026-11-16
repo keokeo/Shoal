@@ -29,8 +29,9 @@ import type { Usage } from './usage.ts';
 import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
 import { gitInfo } from './git.ts';
 import {
-  WorkspaceError, discardFile, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveRawImage, writeFileEntry,
+  WorkspaceError, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveRawImage, writeFileEntry,
 } from './workspace.ts';
+import { createMobileController } from './mobile.ts';
 
 const MAX_BODY = 1024 * 1024;
 const MAX_FILE_BODY = 5 * 1024 * 1024;
@@ -55,6 +56,7 @@ class HttpError extends Error {
 
 export interface AppConfig {
   port: number;
+  mobilePort?: number;
   token: string;
   store: Store;
   sessions: SessionManager;
@@ -180,10 +182,12 @@ export function createApp(cfg: AppConfig) {
   const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
     !!saved && JSON.stringify({ ...saved, cols: next.cols, rows: next.rows }) === JSON.stringify(next);
 
+  let mobile: ReturnType<typeof createMobileController> | null = null;
   const clients = new Set<WebSocket>();
   const broadcast = (m: ServerMsg) => {
     const raw = JSON.stringify(m);
     for (const c of clients) if (c.readyState === 1) c.send(raw);
+    mobile?.onServerMsg(m);
   };
   const activity = createActivityTracker({
     sessions: () => sessions.list(),
@@ -251,6 +255,35 @@ export function createApp(cfg: AppConfig) {
     return project;
   }
 
+  function saveAttachment(ext: string, data: Buffer): { path: string; name: string } {
+    const dir = path.join(cfg.stateDir, 'attachments');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, data);
+    return { path: path.resolve(file), name };
+  }
+
+  function resolveAttachments(list: unknown): string[] {
+    if (list === undefined) return [];
+    if (!Array.isArray(list)) throw new HttpError(400, '附件列表无效');
+    const dir = path.resolve(cfg.stateDir, 'attachments');
+    const out: string[] = [];
+    for (const raw of list) {
+      if (typeof raw !== 'string') throw new HttpError(400, '附件文件名无效');
+      const name = path.basename(raw.trim());
+      if (!/^\d+-[0-9a-f]{8}\.(png|jpg|gif|webp)$/i.test(name)) {
+        throw new HttpError(400, '附件文件名无效');
+      }
+      const full = path.resolve(dir, name);
+      if (!full.startsWith(dir + path.sep) || !fs.existsSync(full)) {
+        throw new HttpError(400, '附件图片不存在');
+      }
+      out.push(/\s/.test(full) ? `"${full}"` : full);
+    }
+    return out;
+  }
+
   function createTask(b: Record<string, unknown>) {
     const body = b as Partial<CreateTaskBody>;
     const project = typeof body.projectId === 'string' ? store.getProject(body.projectId) : undefined;
@@ -262,12 +295,16 @@ export function createApp(cfg: AppConfig) {
     }
     const rawModel = body.model !== undefined ? body.model : store.settings().agyModel;
     const model = agent === 'agy' && rawModel ? rawModel : undefined;
-    const prompt = typeof body.prompt === 'string' ? body.prompt : '';
-    const lastPrompt = promptPreview(prompt);
+    const rawPrompt = typeof body.prompt === 'string' ? body.prompt : '';
+    const files = resolveAttachments(body.attachments);
+    const prompt = files.length
+      ? (rawPrompt.trim() ? `${rawPrompt.trim()}\n${files.join(' ')}` : files.join(' '))
+      : rawPrompt;
+    const lastPrompt = promptPreview(rawPrompt.trim() ? rawPrompt : prompt);
     let title = typeof body.title === 'string' ? body.title.trim() : '';
     let titleAuto = false;
     let fromPrompt = false;
-    if (!title) { title = titleFromPrompt(prompt); fromPrompt = !!title; }
+    if (!title && rawPrompt.trim()) { title = titleFromPrompt(rawPrompt); fromPrompt = !!title; }
     if (!title) {
       const used = new Set(store.tasks().filter(t => t.projectId === project.id).map(t => t.title));
       let n = 1;
@@ -297,7 +334,7 @@ export function createApp(cfg: AppConfig) {
     collab.syncProjectPeers(project.id);
     broadcast({ t: 'task', task });
     broadcast({ t: 'session', session });
-    if (fromPrompt) aiRetitle(task.id, title, prompt);
+    if (fromPrompt) aiRetitle(task.id, title, rawPrompt);
     return { task, session };
   }
 
@@ -492,8 +529,10 @@ export function createApp(cfg: AppConfig) {
 
   function feedback(id: string, b: Record<string, unknown>): FeedbackResult {
     const body = b as Partial<FeedbackBody>;
-    const text = typeof body.text === 'string' ? body.text.trim() : '';
-    if (!text) throw new HttpError(400, '反馈不能为空');
+    const rawText = typeof body.text === 'string' ? body.text.trim() : '';
+    const files = resolveAttachments(body.attachments);
+    if (!rawText && !files.length) throw new HttpError(400, '反馈不能为空');
+    const text = files.length ? (rawText ? `${rawText}\n${files.join(' ')}` : files.join(' ')) : rawText;
     if (body.mode !== 'new' && body.mode !== 'same') throw new HttpError(400, '反馈方式无效');
     const task = store.getTask(id);
     if (!task) throw new HttpError(404, '任务不存在');
@@ -776,23 +815,29 @@ export function createApp(cfg: AppConfig) {
     const origin = req.headers.origin;
     if (origin !== undefined && !allowed.has(origin)) throw new HttpError(403, 'Origin 不被允许');
     const method = req.method ?? 'GET';
+    if (method !== 'GET' && method !== 'HEAD') sessions.markDesktopActive();
     if (method === 'POST' && pathname === '/api/attachments') {
       const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
       const ext = IMAGE_EXT[type];
       if (!ext) throw new HttpError(415, '只支持 PNG、JPEG、GIF、WebP 图片');
       const data = await readBuffer(req, MAX_ATTACHMENT);
       if (data.length === 0) throw new HttpError(400, '图片内容为空');
-      const dir = path.join(cfg.stateDir, 'attachments');
-      fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`);
-      fs.writeFileSync(file, data);
-      return send(res, 200, { path: path.resolve(file) });
+      return send(res, 200, saveAttachment(ext, data));
     }
     let body: Record<string, unknown> = {};
     if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
       if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) throw new HttpError(415, '需要 application/json');
       body = parseJson(await readBody(req, method === 'PUT' ? MAX_FILE_BODY : MAX_BODY));
     }
+    if (method === 'GET' && pathname === '/api/mobile/admin/status') return send(res, 200, mobile!.adminStatus());
+    if (method === 'POST' && pathname === '/api/mobile/admin/config') return send(res, 200, await mobile!.updateConfig(body));
+    if (method === 'POST' && pathname === '/api/mobile/admin/pair/start') return send(res, 200, mobile!.startPairing());
+    if (method === 'POST' && pathname === '/api/mobile/admin/pair/approve') return send(res, 200, mobile!.approvePairing(body));
+    if (method === 'POST' && pathname === '/api/mobile/admin/pair/cancel') return send(res, 200, mobile!.cancelPairing());
+    if (method === 'POST' && pathname === '/api/mobile/admin/devices/revoke-all') return send(res, 200, mobile!.revokeAllDevices());
+    if (method === 'POST' && pathname === '/api/mobile/admin/notify/test') return send(res, 200, await mobile!.sendTestNotification());
+    const mobDev = pathname.match(/^\/api\/mobile\/admin\/devices\/([^/]+)$/);
+    if (method === 'DELETE' && mobDev) return send(res, 200, mobile!.revokeDevice(decodeURIComponent(mobDev[1])));
     if (method === 'GET' && pathname === '/api/state') return send(res, 200, snapshot());
     if (method === 'POST' && pathname === '/api/shutdown' && cfg.onShutdown) {
       send(res, 202, { pid: process.pid });
@@ -1012,12 +1057,63 @@ export function createApp(cfg: AppConfig) {
     else pipeline(fs.createReadStream(file), res, e => { if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[static]', file, e.message); });
   }
 
+  mobile = createMobileController({
+    distDir: DIST,
+    mainPort: cfg.port,
+    mobilePort: cfg.mobilePort,
+    stateDir: cfg.stateDir,
+    store,
+    sessions,
+    activity,
+    availableAgents,
+    snapshot,
+    createTask,
+    renameTask,
+    resumeTask,
+    feedback,
+    switchAgent,
+    forward,
+    setTaskPhase: (task, phase) => setPhase(task, phase),
+    saveAttachment,
+    async listChanges(projectId) {
+      const project = store.getProject(projectId);
+      if (!project) throw new HttpError(404, '项目不存在');
+      invalidateProjectGitCache(project.path);
+      const changes = await listChanges(project.path);
+      if ((changes.git !== null || !gitMap.has(project.id)) && !sameGit(gitMap.get(project.id), changes.git)) {
+        gitMap.set(project.id, changes.git);
+        broadcast({ t: 'git', projectId: project.id, git: changes.git });
+      }
+      return changes;
+    },
+    readDiff(projectId, relPath) {
+      const project = store.getProject(projectId);
+      if (!project) throw new HttpError(404, '项目不存在');
+      return readDiff(project.path, relPath);
+    },
+    resolveRawImage(projectId, relPath) {
+      const project = store.getProject(projectId);
+      if (!project) throw new HttpError(404, '项目不存在');
+      return resolveRawImage(project.path, relPath);
+    },
+    forwardHttpError(err) {
+      if (err instanceof HttpError) return { status: err.status, message: err.message, code: err.code };
+      if (err instanceof WorkspaceError || err instanceof CollabError) return { status: err.status, message: err.message };
+      return null;
+    },
+  });
+
   // DNS rebinding: a foreign page re-pointed at 127.0.0.1 sends same-origin GETs without Origin, but its Host is foreign.
   const hosts = new Set([...allowed].map(o => new URL(o).host));
 
   const server = http.createServer((req, res) => {
-    const pathname = new URL(req.url ?? '/', 'http://x').pathname;
     const run = async () => {
+      let pathname: string;
+      try {
+        pathname = new URL(req.url ?? '/', 'http://x').pathname;
+      } catch {
+        throw new HttpError(400, '请求 URL 无效');
+      }
       if (!hosts.has(req.headers.host ?? '')) throw new HttpError(403, 'Host 不被允许');
       if (pathname === '/hook') return handleHook(req, res);
       if (pathname.startsWith('/api/peer/')) return handlePeer(req, res, pathname);
@@ -1027,6 +1123,11 @@ export function createApp(cfg: AppConfig) {
     };
     run().catch(e => {
       if (res.headersSent) return;
+      const mobErr = mobile?.forwardMobileError(e);
+      if (mobErr) {
+        send(res, mobErr.status, { error: mobErr.message, ...(mobErr.code && { code: mobErr.code }) });
+        return;
+      }
       if (e instanceof HttpError || e instanceof WorkspaceError || e instanceof CollabError) {
         const extra = e instanceof HttpError ? { ...(e.code && { code: e.code }), ...e.extra } : {};
         send(res, e.status, { error: e.message, ...extra });
@@ -1055,10 +1156,20 @@ export function createApp(cfg: AppConfig) {
     clearInterval(gitTimer);
     clearInterval(usageTimer);
     clearInterval(activityTimer);
+    void mobile?.close();
   });
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
-    const pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    let pathname: string;
+    try {
+      pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    } catch {
+      try {
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+      } catch { /* ignore */ }
+      return;
+    }
     const origin = req.headers.origin;
     if (pathname !== '/ws' || origin === undefined || !allowed.has(origin) || !hosts.has(req.headers.host ?? '')) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -1078,12 +1189,12 @@ export function createApp(cfg: AppConfig) {
     for (const r of sessions.replays()) ws.send(JSON.stringify({ t: 'replay', id: r.id, d: r.d } satisfies ServerMsg));
     ws.on('message', raw => {
       let m: ClientMsg;
-      try { m = JSON.parse(raw.toString()); } catch { return; }
-      if (!m || typeof m.id !== 'string') return;
-      if (m.t === 'in' && typeof m.d === 'string') sessions.input(m.id, m.d);
-      else if (m.t === 'resize') sessions.resize(m.id, Number(m.cols), Number(m.rows));
+      try { m = JSON.parse(raw.toString()) as ClientMsg; } catch { return; }
+      if (!m || typeof m !== 'object') return;
+      if (m.t === 'in' && typeof m.id === 'string' && typeof m.d === 'string') sessions.input(m.id, m.d);
+      else if (m.t === 'resize' && typeof m.id === 'string') sessions.resize(m.id, Number(m.cols), Number(m.rows));
     });
   });
 
-  return { server, wss };
+  return { server, wss, mobile };
 }

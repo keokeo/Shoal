@@ -106,6 +106,9 @@ build-desktop.cmd       # 同样的构建，先升版本号：默认 patch，也
 - 跨 CLI 轻量协作（详见 [docs/collab-spec.md](docs/collab-spec.md)）：
   - **同项目静默黑板**：每次主会话结束会自动把最新回复同步到 `<stateDir>/collab/<projectId>/PEERS.md` 与 `turns/<taskId>-latest.md`（并注入 `WORKBENCH_PEERS_FILE`；`agy` 会额外通过 `--add-dir` 获得所属项目黑板的只读/读写路径），任意会话都可直接按需阅读隔壁进度而零打扰。
   - **终端内 `shoal` 命令**：工作台会为会话静默注入 `<stateDir>/bin`（`shoal.cmd` / `shoal`）与会话令牌，支持 `shoal peers`、`shoal send <target> ...` 与 `shoal ask <target> ...`（异步请求并在对方本轮完成后自动回传 1 次，带 4 跳防循环熔断；配套按需技能位于 `skills/shoal-collab/SKILL.md`）。
+- 手机遥控与锁屏提醒（配置教程见 [docs/mobile-guide.md](docs/mobile-guide.md)，设计文档见 [docs/mobile-spec.md](docs/mobile-spec.md)）：点击右上角「手机遥控」即可启用隔离移动安全网关（默认端口 `47801`，不暴露 `47800` 管理接口，全程校验配对设备 Cookie 与 6 位确认码、绝不缩放桌面 ConPTY 尺寸、支持只读 Diff 验收与应急按键）。全部凭据仅存于用户本机 `<stateDir>/mobile.json`：
+  - **三档网络接入**：同局域网 Wi-Fi 零配置直连、免账号一键 Cloudflare Quick Tunnel（`trycloudflare.com`）、或自有域名 Cloudflare Named Tunnel（可选叠加 Cloudflare Access 邮箱白名单）/ Tailscale Serve，并附有代理客户端放行 `7844` 端口的规则排障说明；
+  - **多平台脱敏推送**：支持飞书/Lark（含官方 HMAC-SHA256 签名）、Discord、Slack、Telegram 与通用公网 HTTPS Webhook（仅发项目名、单行任务标题、等待状态与任务深链）。
 
 ## 测试
 

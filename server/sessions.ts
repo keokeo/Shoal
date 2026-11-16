@@ -265,9 +265,26 @@ export class SessionManager {
   private listeners = new Set<(m: ServerMsg) => void>();
   private cfg: SessionManagerConfig;
   private queueTimer: NodeJS.Timeout | null = null;
+  private lastDesktopActive = 0;
 
   constructor(cfg: SessionManagerConfig) {
     this.cfg = cfg;
+  }
+
+  markDesktopActive(now = Date.now()): void {
+    this.lastDesktopActive = now;
+  }
+
+  lastDesktopActiveAt(): number {
+    return this.lastDesktopActive;
+  }
+
+  private syncBlocked(s: Live): boolean {
+    const next = s.permBlocked ? 'permission' : s.startupBlocked ? 'startup' : undefined;
+    if (s.info.blocked === next) return false;
+    if (next) s.info.blocked = next;
+    else delete s.info.blocked;
+    return true;
   }
 
   subscribe(fn: (m: ServerMsg) => void): () => void {
@@ -303,6 +320,12 @@ export class SessionManager {
 
   replays(): { id: string; d: string }[] {
     return [...this.live.values()].filter(s => s.buf).map(s => ({ id: s.info.id, d: (s.trimmed ? modePrefix(s.modes) : '') + s.buf }));
+  }
+
+  replayOf(id: string): string | null {
+    const s = this.live.get(id);
+    if (!s || !s.buf) return null;
+    return (s.trimmed ? modePrefix(s.modes) : '') + s.buf;
   }
 
   private log(obj: unknown) {
@@ -378,7 +401,10 @@ export class SessionManager {
       s.tail = (s.tail + d).slice(-MODE_TAIL);
       if (!s.firstTurnSeen) {
         s.startupTail = (s.startupTail + d).slice(-1024);
-        if (STARTUP_BLOCK_RE.test(stripAnsiForMatch(s.startupTail))) s.startupBlocked = true;
+        if (!s.startupBlocked && STARTUP_BLOCK_RE.test(stripAnsiForMatch(s.startupTail))) {
+          s.startupBlocked = true;
+          if (this.syncBlocked(s) && !s.removed) this.emit({ t: 'session', session: s.info });
+        }
       }
       s.buf += d;
       if (s.buf.length > BUF_MAX) {
@@ -494,6 +520,7 @@ export class SessionManager {
     if (PROMPT_EVENTS.has(body.event)) {
       s.firstTurnSeen = true;
       s.startupBlocked = false;
+      if (this.syncBlocked(s)) changed = true;
       s.deliveringUntil = 0;
       s.hasDraft = false;
       s.interruptedByUser = false;
@@ -514,6 +541,7 @@ export class SessionManager {
     } else if (body.event === 'Stop' || body.event === 'StopFailure') {
       s.firstTurnSeen = true;
       s.startupBlocked = false;
+      if (this.syncBlocked(s)) changed = true;
       s.deliveringUntil = 0;
       s.initialPromptPending = false;
     }
@@ -528,19 +556,21 @@ export class SessionManager {
     }
     if (body.event === 'PermissionRequest') s.permBlocked = true;
     else if (isStatusHook(body.event)) s.permBlocked = false;
+    if (this.syncBlocked(s)) changed = true;
     const before = s.info.status;
     this.apply(s, { type: 'hook', event: body.event });
     if (changed && s.info.status === before) this.emit({ t: 'session', session: s.info });
     return { userTurn, ...(systemInjected && { systemInjected: true }) };
   }
 
-  input(id: string, d: string) {
+  input(id: string, d: string, opts?: { fromMobile?: boolean }) {
     const s = this.live.get(id);
     if (!s || s.info.status === 'exited') return;
     if (isTerminalReportSequence(d)) {
       s.proc.write(d);
       return;
     }
+    if (!opts?.fromMobile) this.lastDesktopActive = Date.now();
     const wasPermBlocked = s.permBlocked;
     s.lastInputAt = Date.now();
     s.inputSeq++;
@@ -569,8 +599,11 @@ export class SessionManager {
         s.hasDraft = true;
       }
     }
+    const blockedChanged = this.syncBlocked(s);
+    const prevStatus = s.info.status;
     s.proc.write(d);
     this.apply(s, { type: 'input', data: d });
+    if (blockedChanged && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
   }
 
   // Queues text to be pasted into the session once it is idle (see deliverable). False if the session is not running.
@@ -610,6 +643,7 @@ export class SessionManager {
     s.lastDeliveryAt = now;
     s.deliveringUntil = now + DELIVERY_INFLIGHT_MS;
     s.permBlocked = false;
+    this.syncBlocked(s);
     if (system) {
       s.systemInjectedPending++;
       s.systemInjectedUntil = now + SYSTEM_INJECT_TTL_MS;

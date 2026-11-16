@@ -9,6 +9,14 @@ export interface MarkdownPreviewProps {
   onOpenRelPath?: (relPath: string, line?: number) => void;
 }
 
+function safeDecodeURIComponent(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 // Resolves a relative POSIX href against the current markdown file's directory inside the project.
 // Returns null if it escapes above the project root.
 function resolveRelativePosix(baseFilePosix: string, relHref: string): string | null {
@@ -84,7 +92,7 @@ export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }:
           const cleanPart = hashIdx === -1 ? href : href.slice(0, hashIdx);
           const frag = hashIdx === -1 ? '' : href.slice(hashIdx);
           const lineMatch = /^#L(\d+)/i.exec(frag);
-          const targetRel = resolveRelativePosix(filePath, decodeURIComponent(cleanPart));
+          const targetRel = resolveRelativePosix(filePath, safeDecodeURIComponent(cleanPart));
           if (!targetRel || !onOpenRelPath) return <span key={k}>{children}</span>;
           return (
             <a
@@ -106,7 +114,7 @@ export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }:
           if (/^https?:\/\//i.test(href)) {
             src = href;
           } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
-            const rel = resolveRelativePosix(filePath, decodeURIComponent(href.split('#')[0].split('?')[0]));
+            const rel = resolveRelativePosix(filePath, safeDecodeURIComponent(href.split('#')[0].split('?')[0]));
             if (rel) src = `/api/projects/${encodeURIComponent(projectId)}/raw?path=${encodeURIComponent(rel)}`;
           }
           if (!src) return <span key={k} className="md-muted">[图片：{img.text || href}]</span>;

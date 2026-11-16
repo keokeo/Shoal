@@ -184,6 +184,8 @@ export interface SessionInfo {
   interrupted?: boolean;
   // The session ran out of quota (resetsAt: ms epoch or null); cleared when the next turn starts.
   limit?: { message: string; resetsAt: number | null; at: number };
+  // Set while paused at an interactive CLI permission or startup folder-trust prompt.
+  blocked?: 'startup' | 'permission';
 }
 
 // Subscription quota windows of one agent's account (claude: 5-hour and 7-day, codex: from its rollout's rate_limits,
@@ -388,6 +390,7 @@ export interface CreateTaskBody {
   agent: AgentKind;
   model?: string; // optional CLI model slug (for agy)
   prompt?: string;
+  attachments?: string[]; // basename-only attachment filenames stored in <stateDir>/attachments
   cols?: number;
   rows?: number;
 }
@@ -421,6 +424,7 @@ export interface ResumeInterruptedResult {
 export interface FeedbackBody {
   text: string;
   mode: 'new' | 'same';
+  attachments?: string[]; // basename-only attachment filenames stored in <stateDir>/attachments
   cols?: number;
   rows?: number;
 }
@@ -542,6 +546,115 @@ export interface HookBody {
   payload: unknown;
 }
 
+// ---- Mobile Access, Tunnel & Notifications ----
+export type MobileRouteVia = 'lan' | 'tunnel' | 'local';
+export type MobileTunnelState = 'stopped' | 'starting' | 'running' | 'error';
+export type MobileTunnelMode = 'named' | 'quick';
+
+export interface MobileTunnelStatus {
+  state: MobileTunnelState;
+  mode: MobileTunnelMode;
+  pid: number | null;
+  startedAt: number | null;
+  connectedEdges: number;
+  quickUrl?: string;
+  lastError?: string;
+  binaryPath: string | null;
+}
+
+export interface PairedDeviceSummary {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number;
+  lastIp: string;
+  via: MobileRouteVia;
+  online: boolean;
+}
+
+export interface MobilePairChallengeView {
+  id: string;
+  status: 'waiting_scan' | 'claimed';
+  pairUrl: string;
+  qrUrls: { label: string; url: string }[];
+  expiresAt: number;
+  deviceName?: string;
+  claimedIp?: string;
+  attemptsLeft: number;
+}
+
+export interface MobilePairClaimResult {
+  claimId: string;
+  claimSecret: string;
+  code: string;
+  deviceName: string;
+  expiresAt: number;
+}
+
+export interface MobilePairRedeemResult {
+  status: 'pending' | 'approved';
+  device?: PairedDeviceSummary;
+}
+
+export interface MobileConfigView {
+  enabled: boolean;
+  port: number;
+  lanEnabled: boolean;
+  keepAwake: boolean;
+  publicOrigin: string;
+  tunnelEnabled: boolean;
+  tunnelMode: MobileTunnelMode;
+  hasTunnelToken: boolean;
+  cfAccessTeamDomain: string;
+  cfAccessAud: string;
+  feishuEnabled: boolean;
+  feishuWebhookUrlMasked: string;
+  hasFeishuSecret: boolean;
+  quietWhenDesktopActive: boolean;
+}
+
+export interface MobileConfigPatch {
+  enabled?: boolean;
+  lanEnabled?: boolean;
+  keepAwake?: boolean;
+  publicOrigin?: string;
+  tunnelEnabled?: boolean;
+  tunnelMode?: MobileTunnelMode;
+  tunnelToken?: string;
+  cfAccessTeamDomain?: string;
+  cfAccessAud?: string;
+  feishuEnabled?: boolean;
+  feishuWebhookUrl?: string;
+  feishuSecret?: string;
+  quietWhenDesktopActive?: boolean;
+}
+
+export interface MobileAdminStatus {
+  config: MobileConfigView;
+  listening: boolean;
+  listenHost: string;
+  actualPort: number | null;
+  lanUrls: string[];
+  powerAwake: boolean;
+  tunnel: MobileTunnelStatus;
+  devices: PairedDeviceSummary[];
+  activePair: MobilePairChallengeView | null;
+}
+
+export type ConversationItem =
+  | { id: string; kind: 'user'; text: string }
+  | { id: string; kind: 'assistant'; text: string }
+  | { id: string; kind: 'tools'; count: number; tools: string[] }
+  | { id: string; kind: 'card'; card: Card };
+
+export interface TaskConversationResponse {
+  taskId: string;
+  sessionId: string | null;
+  agent: AgentKind;
+  items: ConversationItem[];
+  activity: SessionActivity | null;
+}
+
 // ---- WebSocket /ws (same-origin only) ----
 export type ServerMsg =
   | { t: 'snapshot'; state: Snapshot }
@@ -557,8 +670,14 @@ export type ServerMsg =
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
-  | { t: 'out'; id: string; d: string };
+  | { t: 'out'; id: string; d: string }
+  | { t: 'pong'; ts: number; via: MobileRouteVia }
+  | { t: 'revoked' };
 
 export type ClientMsg =
   | { t: 'in'; id: string; d: string }
-  | { t: 'resize'; id: string; cols: number; rows: number };
+  | { t: 'resize'; id: string; cols: number; rows: number }
+  | { t: 'watch-term'; id: string }
+  | { t: 'unwatch-term' }
+  | { t: 'term-key'; id: string; d: string }
+  | { t: 'ping'; ts: number };

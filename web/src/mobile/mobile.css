@@ -1,0 +1,202 @@
+/* Android PWA / Mobile Shell */
+.mob-root {
+  display: flex; flex-direction: column; height: 100dvh; max-height: 100dvh;
+  background: var(--bg); color: var(--text);
+  padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mob-header {
+  flex: none; display: flex; align-items: center; gap: 0.5rem;
+  min-height: 3.125rem;
+  padding: calc(0.375rem + env(safe-area-inset-top)) 0.75rem 0.375rem;
+  background: var(--side); border-bottom: 1px solid var(--line);
+}
+.mob-title-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.0625rem; }
+.mob-title { font-size: 0.9375rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-sub { font-size: 0.75rem; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mob-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.3125rem;
+  min-width: 2.75rem; min-height: 2.75rem; padding: 0 0.75rem;
+  border-radius: 0.5rem; font-size: 0.875rem; font-weight: 500;
+  background: var(--raised); border: 1px solid var(--line-2); color: var(--text);
+}
+.mob-btn.primary { background: var(--text); border-color: var(--text); color: var(--bg); font-weight: 600; }
+.mob-btn.warn { background: var(--signal-bg); border-color: color-mix(in srgb, var(--signal) 50%, transparent); color: var(--signal); }
+.mob-btn.danger { background: rgba(224, 122, 115, .14); border-color: color-mix(in srgb, var(--danger) 50%, transparent); color: var(--danger); }
+.mob-btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+.mob-btn.compact { min-height: 2.25rem; padding: 0 0.625rem; font-size: 0.8125rem; }
+
+.mob-pill {
+  display: inline-flex; align-items: center; gap: 0.3125rem;
+  padding: 0.1875rem 0.5625rem; border-radius: 999px; font-size: 0.75rem;
+  background: var(--surface); border: 1px solid var(--line-2); color: var(--text-2);
+  white-space: nowrap;
+}
+.mob-pill .dot { width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: var(--text-3); }
+.mob-pill.is-online .dot { background: #6fd396; }
+.mob-pill.is-warn { border-color: color-mix(in srgb, var(--signal) 50%, var(--line-2)); color: var(--signal); }
+
+.mob-scroll {
+  flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 0.75rem; display: flex; flex-direction: column; gap: 0.875rem;
+}
+
+.mob-section-title {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 0.75rem; font-weight: 600; color: var(--text-3); letter-spacing: 0.02em;
+  padding: 0 0.125rem;
+}
+
+.mob-quota-row { display: flex; gap: 0.4375rem; overflow-x: auto; padding-bottom: 0.125rem; flex: none; }
+.mob-quota-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 0.375rem;
+  padding: 0.3125rem 0.625rem; border-radius: 0.5rem; font-size: 0.75rem;
+  background: var(--surface); border: 1px solid var(--line); color: var(--text-2);
+}
+.mob-quota-chip.is-warn { border-color: color-mix(in srgb, var(--signal) 50%, var(--line)); color: var(--signal); }
+
+.mob-card-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.mob-task-card {
+  display: flex; flex-direction: column; gap: 0.375rem; width: 100%; text-align: left;
+  padding: 0.75rem 0.875rem; border-radius: 0.625rem;
+  background: var(--surface); border: 1px solid var(--line);
+}
+.mob-task-card.is-attention {
+  border-color: color-mix(in srgb, var(--signal) 45%, var(--line));
+  background: color-mix(in srgb, var(--signal-bg) 45%, var(--surface));
+}
+.mob-task-top { display: flex; align-items: center; gap: 0.5rem; }
+.mob-swatch { width: 0.5rem; height: 0.5rem; border-radius: 50%; flex: none; }
+.mob-task-name { flex: 1; min-width: 0; font-size: 0.9375rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mob-task-summary { font-size: 0.8125rem; color: var(--text-2); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.mob-task-meta { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-size: 0.75rem; color: var(--text-3); }
+
+/* Pair screen */
+.mob-pair-shell {
+  flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 1rem;
+  max-width: 28rem; width: 100%; margin: 0 auto; padding: 1.25rem;
+}
+.mob-pair-card {
+  display: flex; flex-direction: column; gap: 0.75rem; padding: 1.125rem;
+  border-radius: 0.75rem; background: var(--surface); border: 1px solid var(--line-2);
+}
+.mob-claim-digits {
+  text-align: center; padding: 0.875rem; border-radius: 0.625rem;
+  background: var(--bg); border: 1px solid color-mix(in srgb, var(--signal) 45%, var(--line-2));
+  font-family: "Maple Mono NF CN", Consolas, monospace;
+  font-size: 2.125rem; font-weight: 700; letter-spacing: 0.35rem; color: var(--signal);
+}
+.mob-input {
+  width: 100%; min-height: 2.75rem; padding: 0.5625rem 0.75rem; border-radius: 0.5rem;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 0.9375rem;
+}
+.mob-textarea {
+  width: 100%; min-height: 5.5rem; padding: 0.625rem 0.75rem; border-radius: 0.5rem;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 0.9375rem;
+  resize: vertical;
+}
+
+/* Conversation feed */
+.mob-turn-user {
+  align-self: flex-end; max-width: 88%; padding: 0.625rem 0.875rem;
+  border-radius: 0.875rem 0.875rem 0.25rem 0.875rem;
+  background: #232a38; border: 1px solid #323c50; color: var(--text);
+  font-size: 0.875rem; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.mob-turn-assistant {
+  padding: 0.75rem 0.875rem; border-radius: 0.75rem;
+  background: var(--surface); border: 1px solid var(--line);
+  font-size: 0.875rem; line-height: 1.55; overflow-wrap: anywhere;
+}
+.mob-turn-assistant .md-preview { padding: 0; font-size: 0.875rem; }
+.mob-tools-group {
+  border-radius: 0.5rem; background: var(--side); border: 1px solid var(--line);
+  padding: 0.5rem 0.75rem; font-size: 0.8125rem; color: var(--text-2);
+}
+.mob-tools-group summary { cursor: pointer; font-weight: 500; min-height: 1.75rem; display: flex; align-items: center; }
+.mob-tools-list {
+  margin: 0.5rem 0 0; padding: 0 0 0 1rem; display: flex; flex-direction: column; gap: 0.25rem;
+  font-family: "Maple Mono NF CN", Consolas, monospace; font-size: 0.75rem; color: var(--text-3);
+}
+.mob-card-event {
+  padding: 0.5625rem 0.75rem; border-radius: 0.5rem; background: var(--side);
+  border-left: 3px solid var(--work); font-size: 0.8125rem; color: var(--text-2);
+}
+
+.mob-banner {
+  flex: none; display: flex; align-items: center; justify-content: space-between; gap: 0.625rem;
+  padding: 0.5625rem 0.75rem; font-size: 0.8125rem;
+  border-bottom: 1px solid var(--line);
+}
+.mob-banner.is-blocked { background: var(--signal-bg); color: var(--signal); }
+.mob-banner.is-review { background: rgba(144, 181, 220, .10); color: var(--text); }
+
+.mob-composer {
+  flex: none; display: flex; flex-direction: column; gap: 0.4375rem;
+  padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
+  background: var(--side); border-top: 1px solid var(--line);
+}
+.mob-composer-row { display: flex; align-items: flex-end; gap: 0.5rem; }
+.mob-composer-box {
+  flex: 1; min-height: 2.75rem; max-height: 7.5rem; padding: 0.5625rem 0.75rem;
+  border-radius: 0.625rem; background: var(--bg); border: 1px solid var(--line-2);
+  color: var(--text); font-size: 0.9375rem; line-height: 1.4; resize: none;
+}
+.mob-attach-chips { display: flex; flex-wrap: wrap; gap: 0.375rem; }
+.mob-attach-chip {
+  display: inline-flex; align-items: center; gap: 0.25rem;
+  padding: 0.1875rem 0.5rem; border-radius: 999px; font-size: 0.75rem;
+  background: var(--raised); border: 1px solid var(--line-2); color: var(--text-2);
+}
+
+/* Fullscreen drawers & bottom sheets */
+.mob-drawer {
+  position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column;
+  background: var(--bg);
+}
+.mob-term-scroll {
+  flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch;
+  background: var(--term); padding: 0.5rem; touch-action: pan-x pan-y;
+}
+.mob-keybar {
+  flex: none; display: flex; gap: 0.375rem; overflow-x: auto;
+  padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
+  background: var(--side); border-top: 1px solid var(--line);
+}
+.mob-keybar button {
+  flex: none; min-width: 2.875rem; min-height: 2.75rem; padding: 0 0.75rem;
+  border-radius: 0.5rem; background: var(--raised); border: 1px solid var(--line-2);
+  font-family: "Maple Mono NF CN", Consolas, monospace; font-size: 0.875rem; font-weight: 600;
+}
+
+.mob-sheet-backdrop {
+  position: fixed; inset: 0; z-index: 70; background: rgba(0, 0, 0, .6);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.mob-sheet {
+  width: 100%; max-width: 34rem; max-height: 86dvh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 0.75rem;
+  padding: 1rem 1rem calc(1rem + env(safe-area-inset-bottom));
+  background: var(--raised); border-top: 1px solid var(--line-2);
+  border-radius: 0.875rem 0.875rem 0 0;
+}
+.mob-sheet h3 { margin: 0; font-size: 1rem; }
+
+/* Diff viewer */
+.mob-diff-hunk {
+  border: 1px solid var(--line); border-radius: 0.5rem; overflow: hidden; background: var(--side);
+}
+.mob-diff-hunk-head {
+  padding: 0.25rem 0.625rem; background: var(--surface); border-bottom: 1px solid var(--line);
+  font-family: "Maple Mono NF CN", Consolas, monospace; font-size: 0.75rem; color: var(--work);
+}
+.mob-diff-lines { overflow-x: auto; font-family: "Maple Mono NF CN", Consolas, monospace; font-size: 0.75rem; line-height: 1.45; }
+.mob-diff-line { display: flex; min-width: max-content; padding: 0 0.5rem; white-space: pre; }
+.mob-diff-line.add { background: rgba(111, 211, 150, .14); color: #bff2cf; }
+.mob-diff-line.del { background: rgba(224, 122, 115, .14); color: #f6c0bc; }
+.mob-diff-ln { width: 2.5rem; flex: none; color: var(--text-3); user-select: none; }
+.mob-diff-sigil { width: 1rem; flex: none; user-select: none; }

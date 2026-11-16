@@ -20,7 +20,8 @@ export function connect(h: Handlers): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const open = () => {
-    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/ws`);
     socket = ws;
     ws.onopen = () => {
       attempt = 0;
